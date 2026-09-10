@@ -3246,6 +3246,10 @@ let videoWizardState = {
   mergedPreviewUrl: '',
   selectedVoice: 'tiffany',
   editingIdx: null, // non-null when re-editing an existing video shot
+  // Language actually spoken in the uploaded clip. Independent of the project
+  // language: an English-voiced video can be re-voiced into a French project, and the
+  // reverse. Defaults to the project language, the common case.
+  sourceLanguage: 'en',
 };
 
 $('#add-video-btn').addEventListener('click', () => openVideoWizard());
@@ -3262,10 +3266,17 @@ function openVideoWizard(editIdx) {
     mergedPreviewUrl: '',
     selectedVoice: state.selectedVoice || 'tiffany',
     editingIdx: editIdx != null ? editIdx : null,
+    sourceLanguage: state.language,
   };
 
   const byId = (id) => document.getElementById(id);
   byId('video-wizard-modal').hidden = false;
+  byId('vw-source-language-row').hidden = true;
+  byId('vw-translation-row').hidden = true;
+  byId('vw-retranslate-btn').hidden = true;
+  byId('vw-translation-status').textContent = '';
+  renderSourceLanguageSwitch();
+  renderVoiceTargetNote();
   byId('vw-step-audio').hidden = true;
   byId('vw-step-preview').hidden = true;
   byId('vw-file-info').hidden = true;
@@ -3426,26 +3437,149 @@ document.querySelectorAll('input[name="vw-audio-mode"]').forEach((radio) => {
       textLabel.textContent = t('wizard.transcribedText');
       textArea.placeholder = t('wizard.transcribePlaceholder');
       transcribeAction.hidden = false;
+      // The spoken language only matters when transcribing; manual entry is typed
+      // directly in the project language.
+      document.getElementById('vw-source-language-row').hidden = false;
+      renderSourceLanguageSwitch();
+      renderVoiceTargetNote();
       if (videoWizardState.transcribedText) textArea.value = videoWizardState.transcribedText;
     } else {
       textLabel.textContent = t('wizard.narrationText');
       textArea.placeholder = t('wizard.manualPlaceholder');
       transcribeAction.hidden = true;
+      document.getElementById('vw-source-language-row').hidden = true;
+      document.getElementById('vw-translation-row').hidden = true;
     }
   });
 });
 
 // Editing the text invalidates any synthesized audio, so require re-synthesis.
-document.getElementById('vw-narration-text').addEventListener('input', () => {
+document.getElementById('vw-narration-text').addEventListener('input', invalidateWizardAudio);
+
+/** Reflect the selected spoken language of the uploaded clip. */
+function renderSourceLanguageSwitch() {
+  document.querySelectorAll('[data-vw-source-lang]').forEach((button) => {
+    button.setAttribute(
+      'aria-pressed',
+      String(button.dataset.vwSourceLang === videoWizardState.sourceLanguage)
+    );
+  });
+}
+
+/**
+ * Note which language the voice-over will be produced in.
+ *
+ * Only shown when it differs from the spoken language, since that is the case where
+ * a user could otherwise be surprised by the output language.
+ */
+function renderVoiceTargetNote() {
+  const note = document.getElementById('vw-voice-target-note');
+  if (!note) return;
+  if (videoWizardState.sourceLanguage === state.language) {
+    note.hidden = true;
+    return;
+  }
+  note.hidden = false;
+  note.textContent = t('wizard.voiceTargetNote', {
+    target: state.language === 'fr' ? t('language.french') : t('language.english'),
+  });
+}
+
+document.querySelectorAll('[data-vw-source-lang]').forEach((button) => {
+  button.addEventListener('click', () => {
+    const next = button.dataset.vwSourceLang;
+    if (next === videoWizardState.sourceLanguage) return;
+    videoWizardState.sourceLanguage = next;
+    renderSourceLanguageSwitch();
+    renderVoiceTargetNote();
+    // Any existing transcript was produced in the previous language, so it and the
+    // audio derived from it are no longer valid.
+    videoWizardState.transcribedText = '';
+    document.getElementById('vw-narration-text').value = '';
+    document.getElementById('vw-translation-row').hidden = true;
+    invalidateWizardAudio();
+  });
+});
+
+/**
+ * Discard synthesized audio and require re-synthesis.
+ *
+ * Called whenever the narration text or its language changes, so the clip that gets
+ * attached can never be stale relative to the text on screen.
+ */
+function invalidateWizardAudio() {
   if (!videoWizardState.processedAudioUrl) return;
   videoWizardState.processedAudioUrl = '';
   videoWizardState.processedAudioKey = '';
   document.getElementById('vw-audio-preview').hidden = true;
   document.getElementById('vw-finish-btn').hidden = true;
+  document.getElementById('vw-gen-preview-btn').hidden = true;
   const status = document.getElementById('vw-synth-status');
   status.textContent = t('wizard.textChanged');
   status.className = 'text-dim';
   document.getElementById('vw-synthesize-btn').innerHTML = `🔊 ${esc(t('wizard.synthesize'))}`;
+}
+
+/**
+ * Translate the transcript into the project language when the clip is in the other
+ * language, and report what happened.
+ *
+ * @param {string} text Transcribed text in the spoken language.
+ * @returns {Promise<string>} Text in the project language, or the original on failure.
+ */
+async function translateTranscript(text) {
+  const source = videoWizardState.sourceLanguage;
+  const target = state.language;
+  const row = document.getElementById('vw-translation-row');
+  const statusEl = document.getElementById('vw-translation-status');
+  const retryBtn = document.getElementById('vw-retranslate-btn');
+  const label = (lang) => (lang === 'fr' ? t('language.french') : t('language.english'));
+
+  row.hidden = false;
+  retryBtn.hidden = true;
+
+  if (source === target) {
+    statusEl.className = 'text-dim';
+    statusEl.textContent = t('wizard.notTranslated', { source: label(source) });
+    return text;
+  }
+
+  statusEl.className = 'text-busy';
+  statusEl.textContent = `⏳ ${t('wizard.translating')}`;
+
+  try {
+    const res = await postJson('/translate-narration', {
+      text,
+      source_language: source,
+      target_language: target,
+    });
+    const data = await res.json();
+    if (!res.ok || !data.text) {
+      throw new Error(data.detail || t('status.failed'));
+    }
+    statusEl.className = 'text-done';
+    statusEl.textContent = `✓ ${t('wizard.translatedNotice', {
+      source: label(source),
+      target: label(target),
+    })}`;
+    retryBtn.hidden = false;
+    return data.text;
+  } catch (err) {
+    // Keep the original text rather than losing the transcription; the user can edit
+    // or retry. Failing the whole flow here would waste the transcription job.
+    statusEl.className = 'text-error';
+    statusEl.textContent = `✗ ${t('wizard.translationFailed', { error: err.message })}`;
+    retryBtn.hidden = false;
+    return text;
+  }
+}
+
+document.getElementById('vw-retranslate-btn').addEventListener('click', async () => {
+  const source = videoWizardState.transcribedText;
+  if (!source) return;
+  const translated = await translateTranscript(source);
+  document.getElementById('vw-narration-text').value = translated;
+  invalidateWizardAudio();
 });
 
 /** Build the voice chips, using the voices valid for the project language. */
@@ -3497,11 +3631,11 @@ async function transcribeVideo() {
   status.className = 'text-busy';
 
   try {
-    // The project language selects the Transcribe locale; transcribing French audio
-    // as en-US produces unusable text.
+    // The SPOKEN language of the clip selects the Transcribe locale, not the project
+    // language. Transcribing French audio as en-US produces unusable text.
     const startRes = await postJson('/transcribe-video', {
       video_key: videoWizardState.uploadedVideoKey,
-      language: state.language,
+      source_language: videoWizardState.sourceLanguage,
       run_id: state.runId,
     });
     const startData = await startRes.json();
@@ -3519,13 +3653,21 @@ async function transcribeVideo() {
       const pollData = await (await postJson('/transcribe-status', { job_name: jobName })).json();
 
       if (pollData.status === 'COMPLETED') {
-        videoWizardState.transcribedText = pollData.transcription || '';
-        document.getElementById('vw-narration-text').value = pollData.transcription || '';
+        const transcribed = pollData.transcription || '';
+        // Keep the raw transcript so a retranslate starts from the source text rather
+        // than translating an already-translated string.
+        videoWizardState.transcribedText = transcribed;
         btn.innerHTML = `✓ ${esc(t('wizard.transcribed'))}`;
         status.textContent = `✓ ${t('wizard.transcriptionReady')}`;
         status.className = 'text-done';
         btn.disabled = false;
         btn.style.opacity = '';
+
+        // Cross into the project language when the clip is in the other one, so the
+        // synthesized voice-over matches the rest of the storyboard.
+        const forNarration = await translateTranscript(transcribed);
+        document.getElementById('vw-narration-text').value = forNarration;
+        invalidateWizardAudio();
         return;
       }
       if (pollData.status === 'FAILED') {

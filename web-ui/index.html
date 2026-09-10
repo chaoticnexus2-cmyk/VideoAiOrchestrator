@@ -626,9 +626,25 @@
 
         <!-- Voice + Text panel -->
         <div id="vw-voice-panel" class="vw-panel" hidden>
+          <!--
+            Spoken language of the uploaded clip, independent of the project language.
+            An English-voiced video can be re-voiced into a French project and vice
+            versa: transcribe in the spoken language, translate, then synthesize with a
+            voice for the project language.
+          -->
+          <div id="vw-source-language-row" hidden style="margin-bottom:1rem;">
+            <label><span aria-hidden="true">🗣️</span> <span data-i18n="wizard.spokenLanguage">Language spoken in the video</span></label>
+            <div class="lang-switch" role="group" data-i18n-aria-label="wizard.spokenLanguage">
+              <button type="button" data-vw-source-lang="en" data-i18n="language.english">English</button>
+              <button type="button" data-vw-source-lang="fr" data-i18n="language.french">French</button>
+            </div>
+            <p class="panel-note" data-i18n="wizard.spokenLanguageHelp"></p>
+          </div>
+
           <div style="margin-bottom:1rem;">
             <label><span aria-hidden="true">🎙️</span> <span data-i18n="wizard.voice">Voice</span></label>
             <div id="vw-voice-picker" style="display:flex;flex-wrap:wrap;gap:.4rem;"></div>
+            <p class="panel-note" id="vw-voice-target-note"></p>
           </div>
 
           <div id="vw-transcribe-action" hidden style="margin-bottom:.75rem;">
@@ -641,6 +657,12 @@
           <div>
             <label id="vw-text-label" for="vw-narration-text" data-i18n="wizard.narrationText">Narration Text</label>
             <textarea id="vw-narration-text" rows="4" data-i18n-placeholder="wizard.narrationPlaceholder"></textarea>
+            <!-- Reports whether the transcript was translated, and offers a retry. -->
+            <div id="vw-translation-row" hidden style="display:flex;align-items:center;gap:.6rem;margin-top:.4rem;flex-wrap:wrap;">
+              <span id="vw-translation-status" style="font-size:.75rem;"></span>
+              <button class="btn btn-ghost btn-sm" id="vw-retranslate-btn" hidden
+                      data-i18n="wizard.retranslate">Translate again</button>
+            </div>
           </div>
 
           <div style="display:flex;align-items:center;gap:.75rem;margin-top:.75rem;flex-wrap:wrap;">

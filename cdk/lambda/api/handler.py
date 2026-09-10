@@ -756,18 +756,26 @@ async def nova_sonic_synthesize(text, voice_id, region="us-east-1", language="en
 
     audio_chunks = []  # final audio (the first complete reading)
     done = asyncio.Event()
+    # Set on the first audioOutput. Used to stop feeding keep-alive silence, which is
+    # what stops the model taking a second turn and re-reading the text.
+    audio_started = asyncio.Event()
+    # Tracks whether keep_alive already closed the audio content block, so the teardown
+    # below does not close it twice.
+    audio_content_closed = False
+    # Assistant transcript, accumulated so a repeat can be detected as observed fact
+    # rather than inferred from how long the audio turned out to be.
+    transcript_parts = []
 
     async def collect_responses():
         # Termination signals, in priority order:
         #   1. END_TURN contentEnd  -> the model is definitively finished speaking.
         #   2. Audio idle timeout   -> no audioOutput for a while after audio started
-        #      (covers cases where END_TURN is slow/absent).
+        #      (covers a slow or absent END_TURN).
         #
-        # IMPORTANT: the TEXT transcript (textOutput) streams AHEAD of the audio, so
-        # text coverage must NOT be used to stop collection — that truncates the tail.
-        # De-duplication of a repeated reading is handled downstream by the duration
-        # trim (based on the input word count), which is safe and never clips the
-        # first complete reading.
+        # The TEXT transcript streams AHEAD of the audio, so transcript coverage is not
+        # used to stop collection: cutting there would clip the tail of the reading.
+        # It is recorded instead, and used afterwards to establish how many times the
+        # model actually read the text.
         got_audio = False
         last_audio_time = None
         AUDIO_IDLE_STOP = 8.0  # seconds of audio silence => reading finished
@@ -787,7 +795,14 @@ async def nova_sonic_synthesize(text, voice_id, region="us-east-1", language="en
                     if "audioOutput" in evt:
                         audio_chunks.append(base64.b64decode(evt["audioOutput"]["content"]))
                         got_audio = True
+                        audio_started.set()
                         last_audio_time = asyncio.get_event_loop().time()
+                    elif "textOutput" in evt:
+                        # Only the model's own speech transcript matters here; the echo
+                        # of the user turn would otherwise count as a reading.
+                        payload = evt["textOutput"]
+                        if str(payload.get("role", "")).upper() != "USER":
+                            transcript_parts.append(payload.get("content", ""))
                     elif "contentEnd" in evt:
                         if evt["contentEnd"].get("stopReason") == "END_TURN":
                             done.set()
@@ -826,33 +841,57 @@ async def nova_sonic_synthesize(text, voice_id, region="us-east-1", language="en
         },
     }}})
 
-    # System prompt — instruct a single clean reading.
+    # System prompt — force exactly one reading, then an immediate end of turn.
     #
-    # For French the instruction itself is written in French. Nova Sonic's polyglot
-    # voices otherwise tend to drift back toward English pronunciation or prepend an
-    # English acknowledgement to the reading.
+    # Nova Sonic is a conversational speech-to-speech model being driven as a TTS
+    # engine, so it has a standing tendency to keep talking: acknowledge, read, then
+    # read again. French was reliably doubling because the earlier wording buried the
+    # stop condition in prose.
+    #
+    # Two things make the stop authoritative rather than advisory:
+    #   1. The text to read is delimited by explicit tags, so "where the text ends" is
+    #      unambiguous instead of inferred from punctuation.
+    #   2. The rules are numbered and the stop is its own rule, phrased as an action
+    #      taken the instant the final word is spoken.
+    #
+    # For French the instruction is written in French. The polyglot voices otherwise
+    # drift toward English pronunciation or prepend an English acknowledgement.
     language = normalize_language(language)
     if language == "fr":
         system_text = (
-            "Tu es un narrateur de voix hors champ (synthèse vocale). "
-            "Ta SEULE tâche est de lire le texte de l'utilisateur à voix haute, MOT POUR MOT, UNE SEULE FOIS, en FRANÇAIS. "
-            "Ne répète PAS le texte ni aucune partie de celui-ci. "
-            "Ne le lis PAS une deuxième fois. "
-            "N'ajoute AUCUNE salutation, AUCUN commentaire, AUCUN mot avant ou après. "
-            "Ne traduis PAS le texte : lis-le tel quel, en français. "
-            "Après l'avoir lu une fois, ARRÊTE-TOI immédiatement et termine ton tour."
+            "Tu es un MOTEUR DE SYNTHÈSE VOCALE, pas un assistant conversationnel.\n"
+            "RÈGLES ABSOLUES :\n"
+            "1. Tu lis à voix haute, en français, UNIQUEMENT le texte placé entre les balises "
+            "<TEXTE> et </TEXTE>.\n"
+            "2. Tu le lis UNE SEULE FOIS, du début à la fin, mot pour mot.\n"
+            "3. Dès que tu as prononcé le DERNIER MOT, tu TERMINES ton tour IMMÉDIATEMENT. "
+            "Tu ne produis plus aucun son après ce dernier mot.\n"
+            "4. Tu ne répètes JAMAIS le texte, ni en entier, ni en partie, sous aucun prétexte.\n"
+            "5. Tu ne dis rien d'autre : aucune salutation, aucun commentaire, aucune "
+            "confirmation, aucune question, aucun mot avant ou après.\n"
+            "6. Tu ne prononces pas les balises <TEXTE> et </TEXTE> elles-mêmes.\n"
+            "7. Tu ne traduis pas et tu ne reformules pas : tu lis le texte exactement "
+            "tel qu'il est écrit, en français."
         )
-        read_instruction = "Lis le texte suivant à voix haute, mot pour mot, une seule fois, puis arrête-toi :\n\n"
+        read_instruction = "<TEXTE>\n"
+        read_closing = "\n</TEXTE>"
     else:
         system_text = (
-            "You are a text-to-speech voice-over narrator. "
-            "Your ONLY job is to read the user's text aloud VERBATIM, EXACTLY ONCE. "
-            "Do NOT repeat the text or any part of it. "
-            "Do NOT read it a second time. "
-            "Do NOT add greetings, commentary, or any words before or after. "
-            "After reading the text once, STOP immediately and end your turn."
+            "You are a TEXT-TO-SPEECH ENGINE, not a conversational assistant.\n"
+            "ABSOLUTE RULES:\n"
+            "1. Read aloud, in English, ONLY the text placed between the <TEXT> and "
+            "</TEXT> tags.\n"
+            "2. Read it EXACTLY ONCE, start to finish, word for word.\n"
+            "3. The instant you have spoken the LAST WORD, END your turn IMMEDIATELY. "
+            "Produce no further audio after that last word.\n"
+            "4. NEVER repeat the text, in whole or in part, for any reason.\n"
+            "5. Say nothing else: no greeting, no commentary, no confirmation, no "
+            "question, no words before or after.\n"
+            "6. Do not speak the <TEXT> and </TEXT> tags themselves.\n"
+            "7. Do not translate and do not rephrase: read the text exactly as written."
         )
-        read_instruction = "Read the following text aloud, verbatim, exactly once, then stop:\n\n"
+        read_instruction = "<TEXT>\n"
+        read_closing = "\n</TEXT>"
     await send(bidi, {"event": {"contentStart": {
         "promptName": prompt_name, "contentName": sys_name,
         "type": "TEXT", "interactive": True, "role": "SYSTEM",
@@ -912,6 +951,13 @@ async def nova_sonic_synthesize(text, voice_id, region="us-east-1", language="en
             "content": piece + " ",
         }}})
 
+    # Closing delimiter. This is what makes "the last word" unambiguous, so the model
+    # has a definite point at which rule 3 (end the turn immediately) applies.
+    await send(bidi, {"event": {"textInput": {
+        "promptName": prompt_name, "contentName": text_input_name,
+        "content": read_closing,
+    }}})
+
     await send(bidi, {"event": {"contentEnd": {
         "promptName": prompt_name, "contentName": text_input_name,
     }}})
@@ -920,7 +966,13 @@ async def nova_sonic_synthesize(text, voice_id, region="us-east-1", language="en
     silence_chunk = base64.b64encode(b"\x00\x00" * 512).decode("utf-8")
 
     async def keep_alive():
-        while not done.is_set():
+        # The silence exists only to hold the session open until the model starts
+        # speaking. It is USER audio, and Nova Sonic is a conversational model, so
+        # continuing to feed it after the reading has begun reads as another user turn
+        # ending and prompts a second reading of the same text. Stopping as soon as the
+        # first audio arrives is what actually makes the model stop after one read;
+        # prompt wording alone did not.
+        while not done.is_set() and not audio_started.is_set():
             try:
                 await send(bidi, {"event": {"audioInput": {
                     "promptName": prompt_name, "contentName": audio_name,
@@ -929,6 +981,18 @@ async def nova_sonic_synthesize(text, voice_id, region="us-east-1", language="en
             except Exception:
                 break
             await asyncio.sleep(0.1)
+
+        # Close the user audio turn explicitly. Leaving it open is itself an invitation
+        # for the model to keep going.
+        if audio_started.is_set() and not done.is_set():
+            try:
+                await send(bidi, {"event": {"contentEnd": {
+                    "promptName": prompt_name, "contentName": audio_name,
+                }}})
+                nonlocal audio_content_closed
+                audio_content_closed = True
+            except Exception:
+                pass
 
     keepalive_task = asyncio.create_task(keep_alive())
 
@@ -953,14 +1017,182 @@ async def nova_sonic_synthesize(text, voice_id, region="us-east-1", language="en
             pass
 
     try:
-        await send(bidi, {"event": {"contentEnd": {"promptName": prompt_name, "contentName": audio_name}}})
+        if not audio_content_closed:
+            await send(bidi, {"event": {"contentEnd": {"promptName": prompt_name, "contentName": audio_name}}})
         await send(bidi, {"event": {"promptEnd": {"promptName": prompt_name}}})
         await send(bidi, {"event": {"sessionEnd": {}}})
         await bidi.input_stream.close()
     except Exception:
         pass
 
-    return b"".join(audio_chunks)
+    pcm = b"".join(audio_chunks)
+    transcript = "".join(transcript_parts)
+    return _drop_repeated_reading(pcm, text, transcript)
+
+
+def _normalize_for_match(value):
+    """Reduce text to comparable form: lowercase ASCII letters and digits only.
+
+    Punctuation, spacing, casing, and accents all differ between the input text and the
+    model's transcript even when the spoken words are identical. Accents matter most
+    here: a transcript returning "reve" for an input "rêve" would otherwise look like a
+    mismatch and let a genuine doubled French reading through undetected.
+
+    Args:
+        value: Text to normalize.
+
+    Returns:
+        A lowercase, accent-folded string of alphanumeric characters only.
+    """
+    import unicodedata
+
+    # NFKD splits accented characters into base letter plus combining mark; dropping
+    # the marks folds "rêve" and "reve" onto the same form.
+    decomposed = unicodedata.normalize("NFKD", value or "")
+    folded = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.sub(r"[^0-9a-z]+", "", folded.lower())
+
+
+def count_readings(text, transcript):
+    """Count how many times the transcript contains the input text.
+
+    This is the authoritative check for a doubled reading: it compares what the model
+    said it spoke against what it was asked to speak. No audio duration is involved.
+
+    Args:
+        text: The text the model was asked to read.
+        transcript: The model's own speech transcript.
+
+    Returns:
+        Number of complete readings found, or -1 when the comparison is not
+        meaningful (empty input, or a transcript too short to judge).
+    """
+    normalized_text = _normalize_for_match(text)
+    normalized_transcript = _normalize_for_match(transcript)
+    if not normalized_text or not normalized_transcript:
+        return -1
+
+    # A partial transcript (the stream can be cut short) must not be read as zero
+    # readings and trigger a needless cut.
+    if len(normalized_transcript) < len(normalized_text):
+        return -1
+
+    count = 0
+    start = 0
+    while True:
+        found = normalized_transcript.find(normalized_text, start)
+        if found == -1:
+            break
+        count += 1
+        start = found + len(normalized_text)
+    return count
+
+
+def _drop_repeated_reading(pcm, text, transcript):
+    """Remove extra readings when the transcript proves the model repeated itself.
+
+    The prompt instructs the model to read once and end its turn, and that is the real
+    fix. This is a backstop for when it disobeys anyway, and it engages only on
+    evidence: the transcript must contain the full text more than once.
+
+    Deliberately NOT based on estimating how long the clip should have been. The
+    previous implementation allowed up to 2.2x a word-count estimate, which let a
+    doubled reading through untouched while risking clipping legitimate slow speech.
+
+    When the transcript shows N identical readings by one voice at one speaking rate,
+    the audio divides into N near-equal parts, so the first 1/N is kept.
+
+    Args:
+        pcm: Raw PCM audio for the whole turn.
+        text: The text the model was asked to read.
+        transcript: The model's speech transcript.
+
+    Returns:
+        PCM containing a single reading.
+    """
+    readings = count_readings(text, transcript)
+    if readings <= 1:
+        if readings == -1:
+            logger.info("Nova Sonic: transcript unavailable for repeat check, keeping audio as received")
+        return pcm
+
+    sample_rate = 24000
+    nominal = len(pcm) // readings
+    keep = _find_silence_boundary(pcm, nominal, sample_rate)
+    logger.warning(
+        f"Nova Sonic read the text {readings}x despite the single-read instruction; "
+        f"keeping the first reading ({len(pcm)/(sample_rate*2):.1f}s -> {keep/(sample_rate*2):.1f}s)"
+    )
+    return pcm[:keep]
+
+
+def _find_silence_boundary(pcm, nominal_offset, sample_rate, search_seconds=1.0):
+    """Refine a cut point onto the pause between readings.
+
+    The transcript establishes how many readings there are, which puts the boundary at
+    len/N. That is a byte offset, not a speech boundary, so cutting there can clip the
+    tail of the first reading or leave a syllable of the second. Speakers pause between
+    readings, so this searches nearby for the quietest short window and cuts in its
+    middle.
+
+    This refines a boundary already established from the transcript. It does not
+    estimate how long the clip should be.
+
+    Args:
+        pcm: Raw 16-bit mono PCM.
+        nominal_offset: Byte offset of the boundary implied by the reading count.
+        sample_rate: Samples per second.
+        search_seconds: How far either side of the nominal offset to search.
+
+    Returns:
+        A byte offset aligned to a 2-byte sample boundary.
+    """
+    import array
+
+    bytes_per_sample = 2
+    window = int(sample_rate * 0.05) * bytes_per_sample          # 50 ms window
+    span = int(sample_rate * search_seconds) * bytes_per_sample
+
+    low = max(0, nominal_offset - span)
+    high = min(len(pcm), nominal_offset + span)
+    if high - low < window * 2:
+        return nominal_offset - (nominal_offset % bytes_per_sample)
+
+    step = max(window // 4, bytes_per_sample)
+    measurements = []
+
+    for start in range(low, high - window, step):
+        aligned = start - (start % bytes_per_sample)
+        samples = array.array("h")
+        samples.frombytes(pcm[aligned:aligned + window])
+        if not samples:
+            continue
+        # Mean absolute amplitude is enough to locate a pause and is far cheaper than
+        # RMS across a long clip.
+        energy = sum(abs(s) for s in samples) / len(samples)
+        measurements.append((energy, aligned + window // 2))
+
+    if not measurements:
+        return nominal_offset - (nominal_offset % bytes_per_sample)
+
+    quietest_energy = min(energy for energy, _ in measurements)
+    # A pause spans many windows that are all equally quiet. Taking the first match
+    # would cut at the moment speech stops, clipping the following reading's lead-in
+    # and leaving the tail of this one abrupt. The median of the tied-quietest windows
+    # lands in the middle of the pause instead.
+    tolerance = quietest_energy * 0.15 + 5
+    quiet_centres = sorted(
+        centre for energy, centre in measurements if energy <= quietest_energy + tolerance
+    )
+    quietest_offset = quiet_centres[len(quiet_centres) // 2]
+
+    offset = quietest_offset - (quietest_offset % bytes_per_sample)
+    logger.info(
+        f"Nova Sonic: refined cut from {nominal_offset/(sample_rate*2):.2f}s to "
+        f"{offset/(sample_rate*2):.2f}s on the pause between readings "
+        f"(quietest window amplitude {quietest_energy:.0f})"
+    )
+    return offset
 
 
 def _chunk_text_for_tts(text, max_words=200):
@@ -2583,7 +2815,7 @@ def handle_generate_audio(event):
         pcm_data = asyncio.run(nova_sonic_synthesize_long(text, voice_id, language=language))
 
     if pcm_data:
-        wav_bytes = _pcm_to_wav_trimmed(pcm_data, text, shot_index)
+        wav_bytes = _pcm_to_wav(pcm_data, shot_index)
         s3_put(key, wav_bytes, "audio/wav")
         return respond(200, {"audio_url": presigned_url(key), "audio_key": key,
                              "shot_index": shot_index, "voice_id": voice_id})
@@ -2593,22 +2825,33 @@ def handle_generate_audio(event):
     return _polly_fallback(text, shot_index, voice_id, key, language)
 
 
-def _pcm_to_wav_trimmed(pcm_data, text, shot_index):
-    """Wrap PCM as WAV with a generous safety trim against gross doubling."""
+def _pcm_to_wav(pcm_data, shot_index):
+    """Wrap raw PCM as a WAV container.
+
+    No trimming happens here. Duplicate readings are prevented by the single-read
+    instruction in the Nova Sonic prompt and, if the model disobeys, removed by
+    _drop_repeated_reading using the transcript as evidence.
+
+    The previous version trimmed to a word-count duration estimate, which both failed
+    to catch doubling (its 2.2x allowance exceeded a 2x repeat) and risked truncating
+    legitimately slow or heavily punctuated narration.
+
+    Args:
+        pcm_data: Raw 24 kHz mono 16-bit PCM.
+        shot_index: Shot index, for logging only.
+
+    Returns:
+        WAV bytes.
+    """
     import wave
-    word_count = len(text.split())
-    expected_duration = word_count / 2.5
-    max_duration = max(expected_duration * 2.2, 6.0)
+
     sample_rate = 24000
-    max_bytes = int(max_duration * sample_rate) * 2
-    if len(pcm_data) > max_bytes:
-        logger.info(f"Trimming audio for shot {shot_index}: {len(pcm_data)/(sample_rate*2):.1f}s -> {max_duration:.1f}s")
-        pcm_data = pcm_data[:max_bytes]
+    logger.info(f"Shot {shot_index}: writing {len(pcm_data)/(sample_rate*2):.1f}s of narration")
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(24000)
+        wf.setframerate(sample_rate)
         wf.writeframes(pcm_data)
     return buf.getvalue()
 
@@ -2633,7 +2876,7 @@ def _async_generate_audio(payload):
             pcm_data = asyncio.run(nova_sonic_synthesize_long(text, voice_id, language=language))
 
         if pcm_data:
-            wav_bytes = _pcm_to_wav_trimmed(pcm_data, text, shot_index)
+            wav_bytes = _pcm_to_wav(pcm_data, shot_index)
             s3_put(key, wav_bytes, "audio/wav")
             s3_put(status_key, json.dumps({
                 "job_id": job_id, "status": "complete", "shot_index": shot_index,
@@ -3737,7 +3980,15 @@ def handle_demo_data(event):
 
 # ── Transcribe Video (extract audio and transcribe using Amazon Transcribe) ──
 def handle_transcribe_video(event):
-    """Start async transcription of a video using Amazon Transcribe. Returns job_name for polling."""
+    """Start async transcription of a video using Amazon Transcribe.
+
+    The spoken language of the uploaded video is independent of the project language.
+    An English-voiced clip can be dropped into a French project, or the reverse, so the
+    caller sends `source_language` for what is actually spoken in the video. Only when
+    that is absent does the project language act as the fallback.
+
+    Returns a job_name to poll.
+    """
     body = parse_json_body(event)
     video_key = body.get("video_key", "")
 
@@ -3747,9 +3998,13 @@ def handle_transcribe_video(event):
     if not s3_exists(video_key):
         return respond(404, {"detail": "Video not found in S3"})
 
-    # Transcribing with the wrong locale yields unusable text, so the project
-    # language selects the locale.
-    language = normalize_language(body.get("language") or get_run_language(body.get("run_id", "")))
+    # Transcribing with the wrong locale yields unusable text, so this must reflect
+    # what is spoken in the video, not what the project is authored in.
+    language = normalize_language(
+        body.get("source_language")
+        or body.get("language")
+        or get_run_language(body.get("run_id", ""))
+    )
 
     try:
         import time
@@ -3776,8 +4031,15 @@ def handle_transcribe_video(event):
             OutputKey=f"transcriptions/{job_name}.json",
         )
 
-        logger.info(f"Started transcription job: {job_name} for {video_key}")
-        return respond(200, {"job_name": job_name, "status": "IN_PROGRESS"})
+        logger.info(
+            f"Started transcription job {job_name} for {video_key} "
+            f"in {TRANSCRIBE_LANGUAGE_CODES[language]}"
+        )
+        return respond(200, {
+            "job_name": job_name,
+            "status": "IN_PROGRESS",
+            "source_language": language,
+        })
 
     except Exception as e:
         logger.exception(f"Failed to start transcription: {e}")
@@ -3835,6 +4097,84 @@ def handle_transcribe_status(event):
     except Exception as e:
         logger.exception(f"Transcription status check failed: {e}")
         return respond(500, {"detail": f"Status check failed: {str(e)}"})
+
+
+# ── Translate Narration (cross-language re-voicing of uploaded video) ──
+def handle_translate_narration(event):
+    """Translate narration text between the supported languages.
+
+    Used when an uploaded video is voiced in one language and the project needs it in
+    the other: transcribe in the spoken language, translate here, then synthesize with
+    a voice for the target language.
+
+    Unlike translate_prompt_to_english this produces text meant to be *spoken*, so it
+    optimizes for natural delivery and preserved timing rather than for literal
+    structure. It keeps roughly the same length, because the result is dubbed over
+    footage of a fixed duration.
+    """
+    body = parse_json_body(event)
+    text = (body.get("text") or "").strip()
+    source_language = normalize_language(body.get("source_language"))
+    target_language = normalize_language(body.get("target_language"))
+
+    if not text:
+        return respond(400, {"detail": "text is required"})
+
+    if source_language == target_language:
+        # Nothing to do. Answering successfully keeps the caller simple.
+        return respond(200, {
+            "text": text,
+            "translated": False,
+            "source_language": source_language,
+            "target_language": target_language,
+        })
+
+    source_name = LANGUAGE_NAMES[source_language]
+    target_name = LANGUAGE_NAMES[target_language]
+
+    system = (
+        f"You translate voice-over narration from {source_name} to {target_name}.\n"
+        "RULES:\n"
+        "- Return ONLY the translated narration. No preamble, no quotes, no notes.\n"
+        "- This will be read aloud over existing video, so keep the spoken length as "
+        "close to the original as you can. Prefer natural phrasing over literal wording.\n"
+        "- Preserve the tone and register of the original.\n"
+        "- Keep proper nouns, brand names, and place names unchanged.\n"
+        "- Expand nothing and add nothing that is not in the source.\n"
+        "- Write out numbers and abbreviations the way they should be spoken."
+    )
+    if target_language == "fr":
+        system += (
+            "\n- Use natural, idiomatic French with French typographic convention: a "
+            "space before : ; ! and ?, and guillemets for quotations."
+        )
+
+    try:
+        translated = call_claude(system, text, max_tokens=4000).strip().strip('"').strip("'")
+        if not translated:
+            logger.warning("Narration translation returned empty text; keeping the original")
+            return respond(200, {
+                "text": text,
+                "translated": False,
+                "source_language": source_language,
+                "target_language": target_language,
+                "detail": "Translation returned no text",
+            })
+
+        logger.info(
+            f"Translated narration {source_language} -> {target_language} "
+            f"({len(text)} chars -> {len(translated)} chars)"
+        )
+        return respond(200, {
+            "text": translated,
+            "original_text": text,
+            "translated": True,
+            "source_language": source_language,
+            "target_language": target_language,
+        })
+    except ClientError as e:
+        logger.exception(f"Narration translation failed {source_language} -> {target_language}")
+        return respond(500, {"detail": str(e)})
 
 
 # ── Preview Merge (merge video + audio into a preview clip) ──
@@ -3967,6 +4307,7 @@ ROUTES = {
     ("POST", "/api/runs/{run_id}/save-as"):                  handle_save_as_project,
     ("POST", "/api/transcribe-video"):                       handle_transcribe_video,
     ("POST", "/api/transcribe-status"):                      handle_transcribe_status,
+    ("POST", "/api/translate-narration"):                    handle_translate_narration,
     ("POST", "/api/preview-merge"):                          handle_preview_merge,
     ("POST", "/api/preview-merge-status"):                   handle_preview_merge_status,
     ("POST", "/api/presign-key"):                            handle_presign_key,
