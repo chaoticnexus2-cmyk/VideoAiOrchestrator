@@ -8,7 +8,6 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as apigateway from "aws-cdk-lib/aws-apigateway";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
-import * as ssm from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 import * as path from "path";
 
@@ -108,11 +107,17 @@ export class VaioStack extends cdk.Stack {
     // 3. IAM ROLE (shared by both Lambdas)
     // ─────────────────────────────────────────────────────────
 
-    const geminiKeyParam = ssm.StringParameter.fromStringParameterName(
-      this,
-      "GeminiKeyParam",
-      GEMINI_KEY_PARAM
-    );
+    // The ARN is built by hand rather than imported with
+    // ssm.StringParameter.fromStringParameterName, because that produces a
+    // CloudFormation parameter reference and CloudFormation rejects SecureString
+    // types. Nothing needs the value at deploy time (the handler reads it at runtime
+    // through the SSM API), so only the IAM grant matters here.
+    const geminiKeyArn = cdk.Stack.of(this).formatArn({
+      service: "ssm",
+      resource: "parameter",
+      resourceName: GEMINI_KEY_PARAM.replace(/^\//, ""),
+      arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
+    });
 
     const lambdaRole = new iam.Role(this, "LambdaRole", {
       roleName: `${PREFIX}-lambda-role`,
@@ -171,13 +176,19 @@ export class VaioStack extends cdk.Stack {
                 `arn:aws:lambda:${this.region}:${this.account}:function:${PREFIX}-api`,
               ],
             }),
+            new iam.PolicyStatement({
+              // Read the Gemini API key at runtime. Decryption uses the AWS-managed
+              // alias/aws/ssm key, whose key policy already allows use by this
+              // account through SSM, so no separate kms:Decrypt grant is required.
+              actions: ["ssm:GetParameter"],
+              resources: [geminiKeyArn],
+            }),
           ],
         }),
       },
     });
 
     assetsBucket.grantReadWrite(lambdaRole);
-    geminiKeyParam.grantRead(lambdaRole);
 
     // ─────────────────────────────────────────────────────────
     // 4. MERGE LAMBDA
