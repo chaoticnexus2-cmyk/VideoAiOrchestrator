@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# CDK
+cdk.out/
+*.d.ts
+cdk/bin/*.js
+cdk/lib/*.js
+
+# Lambda build output (regenerate with scripts/build-api-lambda.ps1)
+cdk/lambda/api-build/
+cdk/lambda/**/*.zip
+
+# Frontend build output (regenerate with scripts/build-frontend.ps1)
+web-ui-dist/
+
+# Generated runtime config (written by scripts/write-frontend-config.ps1)
+web-ui/config.js
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Generated media / scratch output
+output/
+video-output/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.log
+
+# Python bytecode
+__pycache__/
+*.pyc
