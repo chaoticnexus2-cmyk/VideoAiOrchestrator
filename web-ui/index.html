@@ -61,12 +61,19 @@
                  onkeydown="if(event.key==='Enter')doSignIn()">
         </div>
         <button class="btn btn-primary auth-submit" onclick="doSignIn()" data-i18n="auth.signIn">Sign In</button>
-        <p class="auth-alt">
+
+        <!--
+          Self-registration is disabled by default, so the sign-up link starts hidden
+          and is only revealed when config.js reports the pool actually allows it.
+          Offering a link Cognito would reject is worse than offering none.
+        -->
+        <p class="auth-alt" id="auth-signup-prompt" hidden>
           <span data-i18n="auth.noAccount">No account?</span>
           <a href="#" id="auth-signup-link"
              onclick="event.preventDefault();document.getElementById('auth-error').textContent='';doSignUp();"
              data-i18n="auth.signUp">Sign up</a>
         </p>
+        <p class="auth-alt" id="auth-invite-only" data-i18n="auth.inviteOnly"></p>
       </div>
 
       <div id="auth-new-password-section" hidden>
@@ -693,6 +700,10 @@
     console.error('VAIO: config.js is missing Cognito settings. Run scripts/build-frontend.ps1.');
   }
 
+  // Fail closed: anything other than an explicit true is treated as disabled, so an
+  // older or hand-edited config.js cannot surface a sign-up link the pool rejects.
+  const allowSelfSignUp = config.allowSelfSignUp === true;
+
   const cognitoPool = new AmazonCognitoIdentity.CognitoUserPool({
     UserPoolId: config.cognitoUserPoolId,
     ClientId: config.cognitoClientId,
@@ -760,6 +771,12 @@
   };
 
   window.doSignUp = function doSignUp() {
+    // Guard in the handler as well as the markup. The link is hidden when
+    // registration is closed, but the function is reachable from the console.
+    if (!allowSelfSignUp) {
+      showError('auth.signUpDisabled', true);
+      return;
+    }
     const email = el('auth-email').value.trim();
     const password = el('auth-password').value;
     showError('');
@@ -793,7 +810,12 @@
     showLogin();
   };
 
-  document.addEventListener('DOMContentLoaded', checkAuth);
+  document.addEventListener('DOMContentLoaded', () => {
+    // Show either the sign-up link or the invite-only notice, never both.
+    el('auth-signup-prompt').hidden = !allowSelfSignUp;
+    el('auth-invite-only').hidden = allowSelfSignUp;
+    checkAuth();
+  });
 })();
 </script>
 <script src="app.js" defer></script>

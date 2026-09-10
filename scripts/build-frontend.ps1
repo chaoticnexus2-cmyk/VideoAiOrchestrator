@@ -86,6 +86,14 @@ else {
     # ApiGatewayURL comes back as https://<id>.execute-api.<region>.amazonaws.com/prod/
     $apiBase = $outputs["ApiGatewayURL"].TrimEnd("/")
 
+    # Read from the stack rather than assumed, so the sign-in screen always matches
+    # what the pool permits. Absent output is treated as closed: failing safe here
+    # means at worst the Sign up link is hidden when it could have been shown.
+    $allowSelfSignUp = 'false'
+    if ($outputs.ContainsKey("SelfSignUpEnabled") -and $outputs["SelfSignUpEnabled"] -eq 'true') {
+        $allowSelfSignUp = 'true'
+    }
+
     # ASCII only: this file is machine-generated and there is no reason to risk an
     # encoding round trip over a typographic dash.
     $configLines = @(
@@ -96,11 +104,13 @@ else {
         "  cognitoUserPoolId: '$($outputs["UserPoolId"])',",
         "  cognitoClientId: '$($outputs["UserPoolClientId"])',",
         "  region: '$Region',",
+        "  allowSelfSignUp: $allowSelfSignUp,",
         "};"
     )
     Write-TextFile (Join-Path $distDir "config.js") (($configLines -join "`n") + "`n")
-    Write-Host "  API:  $apiBase/api" -ForegroundColor DarkGray
-    Write-Host "  Pool: $($outputs["UserPoolId"])" -ForegroundColor DarkGray
+    Write-Host "  API:          $apiBase/api" -ForegroundColor DarkGray
+    Write-Host "  Pool:         $($outputs["UserPoolId"])" -ForegroundColor DarkGray
+    Write-Host "  Self sign-up: $allowSelfSignUp" -ForegroundColor DarkGray
 }
 
 $files = (Get-ChildItem -Path $distDir -File | Measure-Object).Count

@@ -143,6 +143,9 @@ available in `ca-central-1`.
 
 # Build both bundles, deploy the stack, publish the frontend.
 .\scripts\deploy.ps1
+
+# Self-registration is disabled, so create the first account yourself.
+.\scripts\create-user.ps1 -Email you@example.com
 ```
 
 `deploy.ps1` runs in phases because the frontend needs values that only exist after the
@@ -169,15 +172,52 @@ Linux `.so` files do.
 | Gemini API key | SSM SecureString `/vaio/gemini-api-key` | Read at Lambda cold start and cached. Never in an environment variable or in git. |
 | Claude models | `CLAUDE_MODEL_ID`, `CLAUDE_FAST_MODEL_ID` | Default to Opus 5 and Sonnet 5. |
 | Default language | `DEFAULT_LANGUAGE` | Fallback when a request or manifest has none. |
+| Self-registration | `cdk deploy -c allowSelfSignUp=true` | **Off by default.** See below. |
 | API URL, Cognito IDs | `web-ui/config.js` | Generated from stack outputs; gitignored. |
 
 Nothing environment-specific is committed. `config.js` is written at build time from
 CloudFormation outputs.
 
+## Accounts and access
+
+Cognito self-registration is **disabled by default**. The console is served from a
+public CloudFront URL, so open registration would let anyone inside the geo-restriction
+create an account and start spending Bedrock inference on generation runs.
+
+The pool is admin-create-only. Add users with:
+
+```powershell
+.\scripts\create-user.ps1 -Email someone@example.com
+```
+
+That prints a temporary password rather than emailing it, so the credential does not
+travel over email — pass it along over a channel you trust. Add `-SendEmail` to have
+Cognito send the invitation instead. Invited users land in `FORCE_CHANGE_PASSWORD` and
+set their own password on first sign-in, through the challenge flow the console already
+handles.
+
+The sign-in screen reflects this automatically: `SelfSignUpEnabled` is a stack output,
+`build-frontend.ps1` writes it into `config.js`, and the console shows either a **Sign
+up** link or an invite-only notice. It fails closed — anything other than an explicit
+`true` is treated as disabled, so a stale or hand-edited `config.js` cannot surface a
+link that Cognito would reject.
+
+To open registration:
+
+```powershell
+cd cdk
+npx cdk deploy VaioStack -c allowSelfSignUp=true
+```
+
+Only do that behind a further control, such as a pre-sign-up Lambda trigger that
+restricts registration to an allowed email domain. Without one, the CloudFront
+geo-restriction is the only thing standing between a stranger and your inference bill.
+
 ## Security notes
 
 - All `/api/*` routes require a Cognito ID token. `/health` is intentionally open so
   deployments can be smoke tested; it returns only service name, status, and timestamp.
+- Cognito self-registration is off by default; accounts are created by an operator.
 - The Gemini key lives in SSM Parameter Store as a SecureString. The predecessor project
   had it hardcoded in the CDK source.
 - CloudFront is geo-restricted to Canada.

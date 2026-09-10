@@ -26,9 +26,30 @@ const GEMINI_KEY_PARAM = `/${PREFIX}/gemini-api-key`;
 /** Object key of the pre-built merge Lambda bundle (ffmpeg + moviepy, ~52 MB). */
 const MERGE_BUNDLE_KEY = "merge-lambda.zip";
 
+export interface VaioStackProps extends cdk.StackProps {
+  /**
+   * Allow visitors to create their own accounts.
+   *
+   * Defaults to false, and should stay false. The console is served from a public
+   * CloudFront URL, so self-registration would let anyone inside the geo-restriction
+   * create an account and start spending Bedrock inference on generation runs.
+   *
+   * With this off, the pool is admin-create-only: operators add users with
+   * scripts/create-user.ps1. Invited users land in FORCE_CHANGE_PASSWORD and set
+   * their own password on first sign-in through the existing challenge flow.
+   *
+   * Only enable it behind an additional control such as a pre-sign-up Lambda trigger
+   * that restricts registration to an allowed email domain.
+   */
+  readonly allowSelfSignUp?: boolean;
+}
+
 export class VaioStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props?: VaioStackProps) {
     super(scope, id, props);
+
+    // Closed by default: opening registration has to be a deliberate act.
+    const allowSelfSignUp = props?.allowSelfSignUp ?? false;
 
     // ─────────────────────────────────────────────────────────
     // 1. S3 BUCKETS
@@ -72,7 +93,9 @@ export class VaioStack extends cdk.Stack {
 
     const userPool = new cognito.UserPool(this, "UserPool", {
       userPoolName: `${PREFIX}-users`,
-      selfSignUpEnabled: true,
+      // false sets AdminCreateUserConfig.AllowAdminCreateUserOnly, so the public
+      // SignUp API is rejected and accounts can only be created by an operator.
+      selfSignUpEnabled: allowSelfSignUp,
       signInAliases: { email: true },
       autoVerify: { email: true },
       standardAttributes: { email: { required: true, mutable: true } },
@@ -351,6 +374,13 @@ export class VaioStack extends cdk.Stack {
     new cdk.CfnOutput(this, "ApiGatewayURL", { value: api.url });
     new cdk.CfnOutput(this, "UserPoolId", { value: userPool.userPoolId });
     new cdk.CfnOutput(this, "UserPoolClientId", { value: userPoolClient.userPoolClientId });
+    // The frontend reads this via generated config.js so the sign-in screen always
+    // matches what the pool actually permits, instead of offering a Sign up link
+    // that Cognito would reject.
+    new cdk.CfnOutput(this, "SelfSignUpEnabled", {
+      value: String(allowSelfSignUp),
+      description: "Whether visitors can register their own accounts",
+    });
     new cdk.CfnOutput(this, "CognitoDomain", {
       value: `${userPoolDomain.domainName}.auth.${this.region}.amazoncognito.com`,
     });
