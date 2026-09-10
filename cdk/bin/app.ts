@@ -5,10 +5,20 @@ import { VaioStack } from "../lib/vaio-stack";
 
 const app = new cdk.App();
 
-// Account and region are overridable from the CDK CLI context so the stack can
-// be deployed into another account without editing source:
-//   cdk deploy -c account=111122223333 -c region=us-east-1
-const account = app.node.tryGetContext("account") ?? process.env.CDK_DEFAULT_ACCOUNT ?? "493512621622";
+// The account is resolved from the environment rather than hardcoded. The CDK CLI
+// sets CDK_DEFAULT_ACCOUNT from whatever credentials are in use, so the normal path
+// needs no argument; an explicit override is available for cross-account deploys:
+//   cdk deploy -c account=111122223333
+//
+// A concrete account is required rather than deploying environment-agnostic, because
+// the stack derives globally unique S3 bucket names from it.
+const account = app.node.tryGetContext("account") ?? process.env.CDK_DEFAULT_ACCOUNT;
+if (!account) {
+  throw new Error(
+    "Could not determine the AWS account. Configure credentials so the CDK CLI can " +
+      "resolve CDK_DEFAULT_ACCOUNT, or pass one explicitly: cdk deploy -c account=111122223333"
+  );
+}
 
 // us-east-1 is required, not just conventional: Nova Sonic bidirectional
 // streaming, Nova Canvas, and the `us.anthropic.*` Claude inference profiles
