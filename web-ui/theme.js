@@ -14,6 +14,12 @@
  * flash to light-theme users.
  */
 
+// Wrapped in an IIFE for the same reason as i18n.js: as a classic script, every
+// top-level declaration here would become a global and could collide with app.js.
+// The only intended export is window.VaioTheme, assigned at the bottom.
+(function () {
+'use strict';
+
 const THEME_STORAGE_KEY = 'vaio.theme';
 const THEME_SETTINGS = ['light', 'dark', 'system'];
 const DEFAULT_THEME_SETTING = 'system';
@@ -131,3 +137,5 @@ window.VaioTheme = {
 // Apply immediately, before first paint. No event on this pass: nothing is listening
 // yet, and firing would be misleading.
 applyTheme(false);
+
+})();

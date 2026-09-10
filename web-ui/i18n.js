@@ -26,6 +26,17 @@
  *   data-i18n-aria-label="key"   -> aria-label attribute
  */
 
+// Wrapped in an IIFE so nothing leaks to the global scope. This file loads as a
+// classic script, where a top-level `function t()` would become a global binding and
+// collide with app.js destructuring `const { t } = window.VaioI18n` — a collision that
+// makes the whole of app.js fail to parse, taking every event listener with it.
+// The only intended export is window.VaioI18n, assigned at the bottom.
+//
+// The body is deliberately left unindented to keep this wrapper reviewable as a
+// two-line change rather than a whole-file reformat.
+(function () {
+'use strict';
+
 const I18N_STRINGS = {
   en: {
     // ── App shell ──
@@ -1084,3 +1095,5 @@ if (document.readyState === 'loading') {
 } else {
   applyTranslations();
 }
+
+})();

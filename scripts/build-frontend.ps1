@@ -36,6 +36,16 @@ if (-not (Test-Path $sourceDir)) {
     throw "Frontend source not found: $sourceDir"
 }
 
+# Validate before staging. This catches the class of bug that parsing files
+# individually cannot: classic scripts share one global lexical scope, so a top-level
+# declaration in two files makes the browser reject an entire file, taking every
+# listener in it with it. Also checks translation parity and theme-token parity.
+Write-Host "Validating frontend" -ForegroundColor Cyan
+node (Join-Path $PSScriptRoot "validate-frontend.js") $sourceDir
+if ($LASTEXITCODE -ne 0) {
+    throw "Frontend validation failed. Fix the problems above before publishing."
+}
+
 Write-Host "Staging frontend into $distDir" -ForegroundColor Cyan
 if (Test-Path $distDir) {
     Remove-Item -Recurse -Force $distDir
