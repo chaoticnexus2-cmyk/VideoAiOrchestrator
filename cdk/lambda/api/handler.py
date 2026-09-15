@@ -283,7 +283,7 @@ def presigned_url(key, expires=43200):
     return s3.generate_presigned_url("get_object", Params={"Bucket": ASSETS_BUCKET, "Key": key}, ExpiresIn=expires)
 
 
-def call_claude(system_prompt, user_message, max_tokens=4096, fast=False):
+def call_claude(system_prompt, user_message, max_tokens=4096, fast=False, allow_truncated=False):
     """Invoke Claude through the Bedrock Converse API.
 
     Args:
@@ -306,28 +306,67 @@ def call_claude(system_prompt, user_message, max_tokens=4096, fast=False):
         messages=[{"role": "user", "content": [{"text": user_message}]}],
         inferenceConfig={"maxTokens": max_tokens},
     )
-    return extract_converse_text(response)
+    return extract_converse_text(response, max_tokens=max_tokens, allow_truncated=allow_truncated)
 
 
-def extract_converse_text(response):
+class TruncatedResponseError(RuntimeError):
+    """Raised when Bedrock stopped generating because it ran out of output tokens.
+
+    Carries the partial text so a caller can decide between retrying with a larger
+    budget and discarding the result. Silently accepting the partial text is never
+    right: it reads as complete but ends mid-sentence.
+    """
+
+    def __init__(self, partial_text, max_tokens):
+        super().__init__(
+            f"Model output was truncated at the {max_tokens}-token limit "
+            f"({len(partial_text)} characters produced)"
+        )
+        self.partial_text = partial_text
+        self.max_tokens = max_tokens
+
+
+def extract_converse_text(response, max_tokens=None, allow_truncated=False):
     """Pull the assistant's text out of a Bedrock Converse response.
 
-    Claude 5 models emit a `reasoningContent` block ahead of the `text` block, so
-    indexing content[0] returns the reasoning wrapper and raises KeyError. This
-    scans for the first block that actually carries text and concatenates any
-    further text blocks.
+    Two failure modes are handled explicitly, because both previously passed silently.
+
+    Claude 5 emits a `reasoningContent` block ahead of the `text` block, so indexing
+    content[0] returns the reasoning wrapper and raises KeyError.
+
+    Claude 5 also spends part of the output budget on reasoning before it writes any
+    text, so a budget that looks generous can still run out mid-sentence. Bedrock
+    reports that as stopReason "max_tokens". Accepting it as a complete answer produced
+    narration and transcripts that ended mid-word.
 
     Args:
         response: Raw response dict from bedrock.converse.
+        max_tokens: The budget that was requested, for the error message.
+        allow_truncated: Return partial text instead of raising. Only for callers where
+            a partial answer is genuinely better than none.
 
     Returns:
         The concatenated assistant text.
 
     Raises:
         ValueError: If the response contains no text block at all.
+        TruncatedResponseError: If generation stopped at the token limit and
+            allow_truncated is False.
     """
     blocks = response.get("output", {}).get("message", {}).get("content", []) or []
     texts = [block["text"] for block in blocks if isinstance(block, dict) and "text" in block]
+
+    stop_reason = response.get("stopReason")
+    if stop_reason == "max_tokens":
+        partial = "".join(texts)
+        usage = response.get("usage", {})
+        logger.error(
+            f"Bedrock hit the output token limit (requested maxTokens={max_tokens}, "
+            f"usage={usage}). Produced {len(partial)} characters, which end mid-thought."
+        )
+        if not allow_truncated:
+            raise TruncatedResponseError(partial, max_tokens)
+        return partial
     if not texts:
         block_shapes = [list(block.keys()) for block in blocks if isinstance(block, dict)]
         raise ValueError(
@@ -663,7 +702,12 @@ def translate_characters_to_english(characters, language):
         "- Do not add, drop, or embellish any detail."
     )
     try:
-        raw = call_claude(system, json.dumps(characters, ensure_ascii=False), max_tokens=3000, fast=True)
+        raw = call_claude(
+            system,
+            json.dumps(characters, ensure_ascii=False),
+            max_tokens=max(4000, len(characters) * 1500),
+            fast=True,
+        )
         match = re.search(r"\{[\s\S]*\}", raw)
         if not match:
             logger.warning("Character translation returned no JSON object — keeping originals")
@@ -1701,7 +1745,11 @@ Return ONLY valid JSON. No markdown, no code blocks. Format:
 {{"characters": {{"Character Name": "one-line visual description..."}}, "art_direction": "short style description for all shots"}}
 {language_block}"""
 
-        char_result = call_claude(character_prompt, script, max_tokens=3000)
+        # 3000 was too tight once Claude 5's reasoning tokens are accounted for: a long
+        # script with several characters produced truncated JSON, which failed to parse
+        # and left the run with zero characters and no visible error. A truncation now
+        # raises and surfaces on the job status instead.
+        char_result = call_claude(character_prompt, script, max_tokens=12000)
         json_match = re.search(r"\{[\s\S]*\}", char_result)
         characters = {}
         art_direction = style_override
@@ -2190,7 +2238,10 @@ Return ONLY a valid JSON array. No markdown, no code blocks. Format:
 Available character names: {char_names_json}
 {language_block}"""
 
-        result = call_claude(system_prompt, script, max_tokens=8000)
+        # Scaled to the shot count: twelve shots with detailed prompts and narration
+        # comfortably exceeded a flat 8000 once reasoning tokens are included, and a
+        # truncated JSON array fails to parse.
+        result = call_claude(system_prompt, script, max_tokens=max(16000, shot_count * 2000))
 
         # Extract JSON
         json_match = re.search(r"\[[\s\S]*\]", result)
@@ -4137,7 +4188,14 @@ def handle_transcribe_status(event):
                 transcript_data, _ = s3_get(transcript_key)
                 transcript_json = json.loads(transcript_data)
                 transcription = transcript_json.get("results", {}).get("transcripts", [{}])[0].get("transcript", "")
-                logger.info(f"Transcription complete: {job_name} ({len(transcription)} chars)")
+                # Record the raw length here so the transcript can be compared against
+                # what the refine step returns. Without both numbers there is no way to
+                # tell which stage dropped text.
+                word_count = len(transcription.split())
+                logger.info(
+                    f"Transcription complete: {job_name} — {len(transcription)} chars, "
+                    f"{word_count} words (raw, before any refinement)"
+                )
 
                 # Clean up
                 try:
@@ -4261,11 +4319,45 @@ def handle_refine_narration(event):
             "space before : ; ! and ?, and guillemets for quotations."
         )
 
-    try:
-        refined = call_claude(system, text, max_tokens=6000).strip().strip('"').strip("'")
-    except ClientError as e:
-        logger.exception(f"Narration refinement failed {source_language} -> {target_language}")
-        return respond(500, {"detail": str(e)})
+    # Scale the budget to the input rather than using a fixed number. Claude 5 spends
+    # part of the output budget on reasoning before writing any text, so a fixed 6000
+    # truncated long transcripts mid-word. Roughly 2 tokens per word covers French
+    # output, then 4x headroom for reasoning, with a floor for short inputs.
+    budget = max(8000, original_words * 8)
+
+    refined = ""
+    for attempt, tokens in enumerate((budget, budget * 3), start=1):
+        try:
+            refined = call_claude(system, text, max_tokens=tokens).strip().strip('"').strip("'")
+            break
+        except TruncatedResponseError as exc:
+            # Never return the partial text: it reads as finished but stops mid-sentence,
+            # which is exactly the defect being fixed here.
+            logger.warning(
+                f"Narration refinement truncated at {tokens} tokens on attempt {attempt} "
+                f"for a {original_words}-word input"
+            )
+            if attempt == 2:
+                logger.error(
+                    "Narration refinement truncated even with the enlarged budget; "
+                    "keeping the original transcript"
+                )
+                return respond(200, {
+                    "text": text,
+                    "translated": False,
+                    "polished": False,
+                    "source_language": source_language,
+                    "target_language": target_language,
+                    "original_words": original_words,
+                    "refined_words": len(exc.partial_text.split()),
+                    "detail": (
+                        "The rewrite did not fit within the model's output limit, so the "
+                        "original transcript was kept."
+                    ),
+                })
+        except ClientError as e:
+            logger.exception(f"Narration refinement failed {source_language} -> {target_language}")
+            return respond(500, {"detail": str(e)})
 
     if not refined:
         logger.warning("Narration refinement returned empty text; keeping the original")
