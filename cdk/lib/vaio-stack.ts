@@ -362,6 +362,17 @@ export class VaioStack extends cdk.Stack {
       destinationBucket: websiteBucket,
       distribution,
       distributionPaths: ["/*"],
+      // None of these assets are content-hashed, so index.html and app.js can go stale
+      // independently of each other. A browser holding an older index.html while running
+      // a newer app.js resolves getElementById to null and the UI fails with an opaque
+      // "Cannot set properties of null" error. Objects were previously uploaded with no
+      // Cache-Control at all, which left browsers free to apply heuristic caching.
+      // Forcing revalidation keeps the pair consistent; the files are small, so the cost
+      // is a 304 per load.
+      cacheControl: [
+        s3deploy.CacheControl.noCache(),
+        s3deploy.CacheControl.mustRevalidate(),
+      ],
     });
 
     // ─────────────────────────────────────────────────────────

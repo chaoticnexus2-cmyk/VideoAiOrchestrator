@@ -472,6 +472,8 @@ const I18N_STRINGS = {
     'wizard.voiceoverReady':
       'Voice-over ready — play to preview. Edit the text and re-synthesize if needed.',
     'wizard.textChanged': 'Text changed — re-synthesize to preview.',
+    'wizard.staleUi':
+      'This page is out of date (missing "{id}"). Reload the page to pick up the latest version.',
     'wizard.needText': 'Enter or transcribe some text first.',
     'wizard.videoPreview': 'Video Preview',
     'wizard.generatePreview': 'Generate Preview (Video + Audio)',
@@ -953,6 +955,8 @@ const I18N_STRINGS = {
     'wizard.voiceoverReady':
       'Voix hors champ prête — écoutez l\u2019aperçu. Modifiez le texte et régénérez si nécessaire.',
     'wizard.textChanged': 'Texte modifié — régénérez pour écouter l\u2019aperçu.',
+    'wizard.staleUi':
+      'Cette page n\u2019est pas à jour (élément « {id} » introuvable). Rechargez la page pour obtenir la dernière version.',
     'wizard.needText': 'Saisissez ou transcrivez d\u2019abord du texte.',
     'wizard.videoPreview': 'Aperçu vidéo',
     'wizard.generatePreview': 'Générer l\u2019aperçu (vidéo + audio)',

@@ -3512,17 +3512,35 @@ document.querySelectorAll('[data-vw-source-lang]').forEach((button) => {
  * Called whenever the narration text or its language changes, so the clip that gets
  * attached can never be stale relative to the text on screen.
  */
+/**
+ * Look up an element that the wizard cannot function without.
+ *
+ * A missing node here almost always means the browser is running this app.js against an
+ * index.html from an earlier deploy, so the element simply does not exist yet. Throwing a
+ * named, actionable error beats "Cannot set properties of null", which says nothing about
+ * what to do next.
+ *
+ * @param {string} id Element id.
+ * @returns {HTMLElement} The element.
+ * @throws {Error} If no element has that id.
+ */
+function requireEl(id) {
+  const el = document.getElementById(id);
+  if (!el) throw new Error(t('wizard.staleUi', { id }));
+  return el;
+}
+
 function invalidateWizardAudio() {
   if (!videoWizardState.processedAudioUrl) return;
   videoWizardState.processedAudioUrl = '';
   videoWizardState.processedAudioKey = '';
-  document.getElementById('vw-audio-preview').hidden = true;
-  document.getElementById('vw-finish-btn').hidden = true;
-  document.getElementById('vw-gen-preview-btn').hidden = true;
-  const status = document.getElementById('vw-synth-status');
+  requireEl('vw-audio-preview').hidden = true;
+  requireEl('vw-finish-btn').hidden = true;
+  requireEl('vw-gen-preview-btn').hidden = true;
+  const status = requireEl('vw-synth-status');
   status.textContent = t('wizard.textChanged');
   status.className = 'text-dim';
-  document.getElementById('vw-synthesize-btn').innerHTML = `🔊 ${esc(t('wizard.synthesize'))}`;
+  requireEl('vw-synthesize-btn').innerHTML = `🔊 ${esc(t('wizard.synthesize'))}`;
 }
 
 /**
@@ -3540,9 +3558,9 @@ async function refineTranscript(text) {
   const target = state.language;
   const polishEl = document.getElementById('vw-polish');
   const polish = !!(polishEl && polishEl.checked);
-  const row = document.getElementById('vw-translation-row');
-  const statusEl = document.getElementById('vw-translation-status');
-  const retryBtn = document.getElementById('vw-refine-btn');
+  const row = requireEl('vw-translation-row');
+  const statusEl = requireEl('vw-translation-status');
+  const retryBtn = requireEl('vw-refine-btn');
   const label = (lang) => (lang === 'fr' ? t('language.french') : t('language.english'));
 
   row.hidden = false;

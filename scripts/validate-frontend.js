@@ -122,7 +122,50 @@ if (!tableMatch) {
   else ok(`all ${referenced.size} referenced keys resolve`);
 }
 
-// ── 5. Theme token integrity ────────────────────────────────────────────
+// ── 5. Element IDs referenced from JS actually exist ────────────────────
+// A missing id makes getElementById return null, and the first property assignment on it
+// throws "Cannot set properties of null", which names neither the id nor the file. IDs
+// may come from index.html or from markup app.js injects, so both count. Lazily created
+// elements assign their own id, so those count too.
+console.log('Checking element ids:');
+{
+  const html = read('index.html');
+  const app = sources['app.js'];
+  const defined = new Set();
+  for (const m of html.matchAll(/\bid="([^"${}]+)"/g)) defined.add(m[1]);
+  for (const m of app.matchAll(/\bid="([^"${}]+)"/g)) defined.add(m[1]);
+  for (const m of app.matchAll(/\bid='([^'${}]+)'/g)) defined.add(m[1]);
+  // `el.id = 'foo'` creates the node at runtime.
+  for (const m of app.matchAll(/\.id\s*=\s*['"]([^'"]+)['"]/g)) defined.add(m[1]);
+
+  const referenced = new Map();
+  const patterns = [
+    [/getElementById\(\s*['"]([^'"]+)['"]\s*\)/g, 'getElementById'],
+    [/\bbyId\(\s*['"]([^'"]+)['"]\s*\)/g, 'byId'],
+    [/\brequireEl\(\s*['"]([^'"]+)['"]\s*\)/g, 'requireEl'],
+    [/\$\(\s*['"]#([^'"\s.,[]+)['"]\s*\)/g, '$'],
+  ];
+  for (const [re, via] of patterns) {
+    for (const m of app.matchAll(re)) {
+      const id = m[1];
+      if (id.includes('$') || id.includes('{')) continue; // interpolated at runtime
+      if (!referenced.has(id)) referenced.set(id, via);
+    }
+  }
+
+  const missing = [...referenced.entries()].filter(([id]) => !defined.has(id));
+  if (missing.length) {
+    fail(`${missing.length} element id(s) referenced from app.js but never defined:`);
+    for (const [id, via] of missing) {
+      const line = app.split('\n').findIndex((l) => l.includes(`'${id}'`) || l.includes(`"${id}"`)) + 1;
+      console.error(`       #${id} via ${via} (app.js:${line})`);
+    }
+  } else {
+    ok(`all ${referenced.size} referenced element ids exist`);
+  }
+}
+
+// ── 6. Theme token integrity ────────────────────────────────────────────
 console.log('Checking theme tokens:');
 const css = read('styles.css');
 const tokensFor = (theme) => {

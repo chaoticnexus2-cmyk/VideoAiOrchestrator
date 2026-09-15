@@ -93,7 +93,11 @@ Invoke-Step "5/5 Publish frontend with real config" {
     $distDir = Join-Path $repoRoot "web-ui-dist"
 
     Write-Host "Syncing $distDir to s3://$bucket" -ForegroundColor Cyan
-    aws s3 sync $distDir "s3://$bucket" --delete --region $Region
+    # Must match the cacheControl on the CDK BucketDeployment. Without it this sync
+    # re-uploads the objects with no Cache-Control, undoing the stack's setting and
+    # letting browsers hold a stale index.html against a fresh app.js.
+    aws s3 sync $distDir "s3://$bucket" --delete --region $Region `
+        --cache-control "no-cache, must-revalidate"
     if ($LASTEXITCODE -ne 0) { throw "Frontend sync failed" }
 
     $distId = (aws cloudfront list-distributions `
