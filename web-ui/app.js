@@ -1610,7 +1610,10 @@ async function requestAudio({ shot_index, text, voice_id, run_id, onProgress }) 
   if (!data.async || !data.job_id) throw new Error(data.detail || t('shot.audioGenerationFailed'));
 
   const jobId = data.job_id;
-  const maxPoll = 600000; // 10 minutes
+  // Long narration is synthesized as parallel segments, so wall clock tracks the slowest
+  // segment rather than the total duration. The ceiling is generous anyway: a 10-minute
+  // voice-over previously outlasted a 10-minute window and failed with no useful reason.
+  const maxPoll = 1800000; // 30 minutes
   let elapsed = 0;
   while (elapsed < maxPoll) {
     await new Promise((r) => setTimeout(r, 3000));
@@ -1619,9 +1622,10 @@ async function requestAudio({ shot_index, text, voice_id, run_id, onProgress }) 
     const pd = await pollRes.json();
     if (pd.status === 'complete' && pd.audio_url) return pd;
     if (pd.status === 'error') throw new Error(pd.detail || t('shot.audioGenerationFailed'));
-    if (onProgress) onProgress(Math.round(elapsed / 1000));
+    // Segment counts are far more informative than elapsed seconds on a long job.
+    if (onProgress) onProgress(Math.round(elapsed / 1000), pd.detail || '');
   }
-  throw new Error(t('shot.audioGenerationFailed'));
+  throw new Error(t('shot.audioTimedOut'));
 }
 
 // ─── Regenerate Audio ───
@@ -3774,8 +3778,12 @@ async function synthesizeVoiceover() {
       text,
       voice_id: videoWizardState.selectedVoice || state.selectedVoice,
       run_id: state.runId,
-      onProgress: (seconds) => {
-        status.textContent = `⏳ ${t('wizard.generatingLongVoiceover', { seconds })}`;
+      onProgress: (seconds, detail) => {
+        // The backend reports "N of M segments done" for fanned-out narration, which is
+        // far more reassuring on a ten-minute job than a rising second count.
+        status.textContent = detail
+          ? `⏳ ${detail}`
+          : `⏳ ${t('wizard.generatingLongVoiceover', { seconds })}`;
       },
     });
     if (!data.audio_url) throw new Error(data.detail || t('status.failed'));

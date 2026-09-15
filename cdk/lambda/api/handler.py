@@ -465,6 +465,7 @@ STATUS_MESSAGES = {
         "translating_prompts": "Preparing English image prompts…",
         "complete": "Generated {shots} shots with {characters} consistent characters",
         "generating_audio": "Generating voice-over…",
+        "generating_audio_parts": "Generating voice-over… {done} of {total} segments done",
         "merging": "Merging video and audio…",
     },
     "fr": {
@@ -482,6 +483,7 @@ STATUS_MESSAGES = {
         "translating_prompts": "Préparation des prompts d'image en anglais…",
         "complete": "{shots} plans générés avec {characters} personnages cohérents",
         "generating_audio": "Génération de la voix hors champ…",
+        "generating_audio_parts": "Génération de la voix hors champ… {done} segments sur {total} terminés",
         "merging": "Fusion de la vidéo et de l'audio…",
     },
 }
@@ -2975,7 +2977,21 @@ def _pcm_to_wav(pcm_data, shot_index):
 
 
 def _async_generate_audio(payload):
-    """Async worker: synthesize (possibly long, chunked) audio and store result."""
+    """Async worker: synthesize audio for one narration and store the result.
+
+    Narration that needs more than one Nova Sonic session is fanned out: each session
+    becomes its own Lambda invocation, and a combiner joins the parts once they all exist.
+
+    Nova Sonic streams at roughly real time, so a serial synthesis of ten minutes of speech
+    needs about ten minutes of wall clock. That does not fit inside Lambda's 900-second
+    ceiling, and it also outlasted the frontend's poll window, so long narration failed
+    with no useful diagnosis. Fanning out makes the wall clock the length of the longest
+    single part instead of the sum of all of them.
+
+    Args:
+        payload: Async task payload carrying job_id, text, voice_id, key, shot_index and
+            language.
+    """
     import asyncio
     job_id = payload["job_id"]
     text = payload.get("text", "")
@@ -2986,6 +3002,13 @@ def _async_generate_audio(payload):
     voice_id = resolve_voice(payload.get("voice_id", ""), language)["id"]
 
     try:
+        # Chunk here rather than inside nova_sonic_synthesize_long so each part is a
+        # single session and can be synthesized by its own invocation.
+        chunks = _chunk_text_for_tts(text, max_words=NOVA_SONIC_SESSION_WORD_LIMIT)
+        if len(chunks) > 1:
+            _dispatch_audio_parts(job_id, chunks, voice_id, language, key, shot_index)
+            return
+
         try:
             pcm_data = asyncio.get_event_loop().run_until_complete(
                 nova_sonic_synthesize_long(text, voice_id, language=language)
@@ -3019,8 +3042,212 @@ def _async_generate_audio(payload):
         }).encode(), "application/json")
 
 
+def _audio_parts_prefix(job_id):
+    """Return the S3 prefix holding one job's intermediate PCM parts."""
+    return f"audio-jobs/{job_id}/parts/"
+
+
+def _dispatch_audio_parts(job_id, chunks, voice_id, language, key, shot_index):
+    """Fan a long narration out to one Lambda invocation per Nova Sonic session.
+
+    Args:
+        job_id: Audio job id, used for the status object and the parts prefix.
+        chunks: Sentence-aligned text segments, each within one session's word budget.
+        voice_id: Resolved Nova Sonic voice id.
+        language: Project language code.
+        key: Final S3 key for the assembled WAV.
+        shot_index: Shot this narration belongs to.
+    """
+    total = len(chunks)
+    # Leftovers from an earlier attempt with the same id would be read as valid parts.
+    s3_delete_prefix(_audio_parts_prefix(job_id))
+    s3_put(f"audio-jobs/{job_id}.json", json.dumps({
+        "job_id": job_id, "status": "processing", "shot_index": shot_index,
+        "parts_total": total, "parts_done": 0, "language": language,
+        "detail": status_message("generating_audio", language),
+    }).encode(), "application/json")
+
+    logger.info(
+        f"Audio job {job_id}: {sum(len(c.split()) for c in chunks)} words over {total} "
+        f"parts, dispatching in parallel"
+    )
+    for index, chunk in enumerate(chunks):
+        lambda_client.invoke(
+            FunctionName=SELF_FUNCTION_NAME,
+            InvocationType="Event",
+            Payload=json.dumps({
+                "_async_task": "synthesize_audio_part",
+                "job_id": job_id, "part_index": index, "parts_total": total,
+                "text": chunk, "voice_id": voice_id, "language": language,
+                "key": key, "shot_index": shot_index,
+            }).encode(),
+        )
+
+
+def _async_synthesize_audio_part(payload):
+    """Async worker: synthesize one part of a fanned-out narration.
+
+    Writes raw PCM for its own part, then checks whether it was the last one. Doubling
+    detection stays inside nova_sonic_synthesize, so each part is still protected against
+    the model reading its text twice.
+
+    Args:
+        payload: Async task payload carrying job_id, part_index, parts_total, text,
+            voice_id, language, key and shot_index.
+    """
+    import asyncio
+    job_id = payload["job_id"]
+    part_index = payload["part_index"]
+    total = payload["parts_total"]
+    text = payload.get("text", "")
+    language = normalize_language(payload.get("language"))
+    voice_id = payload.get("voice_id", "")
+    prefix = _audio_parts_prefix(job_id)
+    part_key = f"{prefix}part-{part_index:04d}.pcm"
+
+    pcm = None
+    for attempt in range(2):
+        try:
+            pcm = asyncio.run(nova_sonic_synthesize(text, voice_id, language=language))
+            if pcm:
+                break
+        except Exception as exc:
+            logger.warning(
+                f"Audio job {job_id} part {part_index + 1}/{total} attempt {attempt + 1} "
+                f"failed: {exc}"
+            )
+
+    if pcm:
+        s3_put(part_key, pcm, "application/octet-stream")
+        spoken_seconds = len(pcm) / (24000 * 2)
+        logger.info(
+            f"Audio job {job_id} part {part_index + 1}/{total} ok "
+            f"({len(text.split())} words, {spoken_seconds:.1f}s)"
+        )
+    else:
+        # A marker rather than silence: the combiner must know a part is genuinely
+        # missing instead of waiting for an object that will never appear.
+        s3_put(f"{prefix}part-{part_index:04d}.failed", b"", "text/plain")
+        logger.error(f"Audio job {job_id} part {part_index + 1}/{total} produced no audio")
+
+    _maybe_combine_audio(job_id, total, payload.get("key", ""), payload.get("shot_index", 0),
+                         language)
+
+
+def _maybe_combine_audio(job_id, total, key, shot_index, language):
+    """Dispatch the combiner exactly once, when every part has reported.
+
+    Parts finish concurrently, so more than one can observe the last write. A conditional
+    put elects a single combiner: only the first request to create the claim object
+    succeeds, and the rest get PreconditionFailed.
+
+    Args:
+        job_id: Audio job id.
+        total: Expected number of parts.
+        key: Final S3 key for the assembled WAV.
+        shot_index: Shot this narration belongs to.
+        language: Project language code.
+    """
+    reported = len([
+        obj for obj in s3_list(_audio_parts_prefix(job_id))
+        if obj["Key"].endswith((".pcm", ".failed"))
+    ])
+    if reported < total:
+        return
+
+    claim_key = f"audio-jobs/{job_id}/combine.claim"
+    try:
+        s3.put_object(Bucket=ASSETS_BUCKET, Key=claim_key, Body=b"", IfNoneMatch="*")
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ("PreconditionFailed", "ConditionalRequestConflict"):
+            return  # another part already elected itself
+        raise
+
+    lambda_client.invoke(
+        FunctionName=SELF_FUNCTION_NAME,
+        InvocationType="Event",
+        Payload=json.dumps({
+            "_async_task": "combine_audio_parts",
+            "job_id": job_id, "parts_total": total, "key": key,
+            "shot_index": shot_index, "language": language,
+        }).encode(),
+    )
+
+
+def _async_combine_audio_parts(payload):
+    """Async worker: join a job's PCM parts into one WAV and publish the result.
+
+    Args:
+        payload: Async task payload carrying job_id, parts_total, key, shot_index and
+            language.
+    """
+    job_id = payload["job_id"]
+    total = payload["parts_total"]
+    key = payload.get("key", "")
+    shot_index = payload.get("shot_index", 0)
+    status_key = f"audio-jobs/{job_id}.json"
+    prefix = _audio_parts_prefix(job_id)
+
+    try:
+        sample_rate = 24000
+        pad = b"\x00\x00" * int(sample_rate * 0.2)  # ~200ms between parts
+        segments = []
+        missing = []
+        for index in range(total):
+            part_key = f"{prefix}part-{index:04d}.pcm"
+            if not s3_exists(part_key):
+                missing.append(index + 1)
+                continue
+            data, _ = s3_get(part_key)
+            if segments:
+                segments.append(pad)
+            segments.append(data)
+
+        if not segments:
+            raise RuntimeError(f"No audio parts were produced for job {job_id}")
+
+        pcm_data = b"".join(segments)
+        wav_bytes = _pcm_to_wav(pcm_data, shot_index)
+        s3_put(key, wav_bytes, "audio/wav")
+
+        duration = len(pcm_data) / (sample_rate * 2)
+        status = {
+            "job_id": job_id, "status": "complete", "shot_index": shot_index,
+            "audio_key": key, "audio_url": presigned_url(key),
+            "parts_total": total, "parts_done": total - len(missing),
+            "duration_seconds": round(duration, 1),
+        }
+        if missing:
+            # Report rather than hide it: the audio is short by whole segments, and a
+            # silent partial result is what made earlier truncation hard to notice.
+            status["detail"] = (
+                f"{len(missing)} of {total} segments produced no audio "
+                f"(segments {missing}); the narration is incomplete."
+            )
+            logger.error(f"Audio job {job_id} incomplete: missing parts {missing}")
+        s3_put(status_key, json.dumps(status).encode(), "application/json")
+        logger.info(
+            f"Audio job {job_id} complete: {total - len(missing)}/{total} parts, "
+            f"{duration:.1f}s, {len(wav_bytes)} bytes"
+        )
+    except Exception as exc:
+        logger.exception(f"Audio job {job_id} combine failed: {exc}")
+        s3_put(status_key, json.dumps({
+            "job_id": job_id, "status": "error", "shot_index": shot_index, "detail": str(exc),
+        }).encode(), "application/json")
+    finally:
+        # Intermediate PCM is large; the WAV is the durable artefact.
+        s3_delete_prefix(prefix)
+        s3_delete_prefix(f"audio-jobs/{job_id}/combine.claim")
+
+
 def handle_audio_status(event):
-    """Poll an async audio generation job."""
+    """Poll an async audio generation job.
+
+    While a fanned-out job runs, progress is derived by counting the part objects that
+    exist rather than from a counter in the status file. Parts finish concurrently, so
+    incrementing a shared counter would lose updates to write races.
+    """
     body = parse_json_body(event)
     job_id = body.get("job_id", "")
     if not job_id:
@@ -3029,7 +3256,19 @@ def handle_audio_status(event):
     if not s3_exists(status_key):
         return respond(404, {"detail": "Audio job not found"})
     data, _ = s3_get(status_key)
-    return respond(200, json.loads(data))
+    status = json.loads(data)
+
+    if status.get("status") == "processing" and status.get("parts_total"):
+        done = len([
+            obj for obj in s3_list(_audio_parts_prefix(job_id))
+            if obj["Key"].endswith((".pcm", ".failed"))
+        ])
+        status["parts_done"] = done
+        status["detail"] = status_message(
+            "generating_audio_parts", status.get("language", "en"),
+            done=done, total=status["parts_total"],
+        )
+    return respond(200, status)
 
 
 # ── AI Help (image prompt refinement) ──
@@ -4579,6 +4818,12 @@ def handler(event, context):
             return {"statusCode": 200}
         if task == "generate_audio":
             _async_generate_audio(event)
+            return {"statusCode": 200}
+        if task == "synthesize_audio_part":
+            _async_synthesize_audio_part(event)
+            return {"statusCode": 200}
+        if task == "combine_audio_parts":
+            _async_combine_audio_parts(event)
             return {"statusCode": 200}
         return {"statusCode": 400, "body": f"Unknown task: {task}"}
 

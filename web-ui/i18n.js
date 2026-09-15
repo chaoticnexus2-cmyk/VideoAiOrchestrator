@@ -245,6 +245,7 @@ const I18N_STRINGS = {
     'shot.audioLoadFailed': 'Audio could not be loaded',
     'shot.generationFailed': 'Generation failed — Regenerate',
     'shot.audioGenerationFailed': 'Audio generation failed',
+    'shot.audioTimedOut': 'Audio generation is taking longer than expected. It may still finish — reload to check.',
     'shot.needPromptOrNarration':
       'Please fill in at least an image prompt or a narration script before generating.',
     'shot.cannotDeleteLast': 'You cannot delete the last shot.',
@@ -715,6 +716,7 @@ const I18N_STRINGS = {
     'shot.audioLoadFailed': 'Impossible de charger l\u2019audio',
     'shot.generationFailed': 'Échec de la génération — régénérer',
     'shot.audioGenerationFailed': 'Échec de la génération de l\u2019audio',
+    'shot.audioTimedOut': 'La génération de l\u2019audio est plus longue que prévu. Elle peut encore aboutir — rechargez pour vérifier.',
     'shot.needPromptOrNarration':
       'Veuillez remplir au moins un prompt d\u2019image ou un texte de narration avant de générer.',
     'shot.cannotDeleteLast': 'Vous ne pouvez pas supprimer le dernier plan.',
