@@ -123,5 +123,14 @@ else {
     Write-Host "  Self sign-up: $allowSelfSignUp" -ForegroundColor DarkGray
 }
 
+# Stamp asset URLs with a content hash. Runs last so config.js is already written and
+# gets hashed too. Without this, a browser holding a heuristically cached app.js never
+# revalidates and can pair it with a newer index.html, which resolves ids to null.
+Write-Host "Stamping asset URLs" -ForegroundColor Cyan
+node (Join-Path $PSScriptRoot "stamp-assets.js") $distDir
+if ($LASTEXITCODE -ne 0) {
+    throw "Asset stamping failed."
+}
+
 $files = (Get-ChildItem -Path $distDir -File | Measure-Object).Count
 Write-Host "Frontend bundle ready: $distDir ($files files)" -ForegroundColor Green
