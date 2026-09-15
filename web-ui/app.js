@@ -3273,7 +3273,8 @@ function openVideoWizard(editIdx) {
   byId('video-wizard-modal').hidden = false;
   byId('vw-source-language-row').hidden = true;
   byId('vw-translation-row').hidden = true;
-  byId('vw-retranslate-btn').hidden = true;
+  byId('vw-refine-btn').hidden = true;
+  byId('vw-polish-row').hidden = true;
   byId('vw-translation-status').textContent = '';
   renderSourceLanguageSwitch();
   renderVoiceTargetNote();
@@ -3440,6 +3441,9 @@ document.querySelectorAll('input[name="vw-audio-mode"]').forEach((radio) => {
       // The spoken language only matters when transcribing; manual entry is typed
       // directly in the project language.
       document.getElementById('vw-source-language-row').hidden = false;
+      // Polishing only applies to transcribed speech; manually typed narration is
+      // already written text and needs no filler removal.
+      document.getElementById('vw-polish-row').hidden = false;
       renderSourceLanguageSwitch();
       renderVoiceTargetNote();
       if (videoWizardState.transcribedText) textArea.value = videoWizardState.transcribedText;
@@ -3448,6 +3452,7 @@ document.querySelectorAll('input[name="vw-audio-mode"]').forEach((radio) => {
       textArea.placeholder = t('wizard.manualPlaceholder');
       transcribeAction.hidden = true;
       document.getElementById('vw-source-language-row').hidden = true;
+      document.getElementById('vw-polish-row').hidden = true;
       document.getElementById('vw-translation-row').hidden = true;
     }
   });
@@ -3521,64 +3526,100 @@ function invalidateWizardAudio() {
 }
 
 /**
- * Translate the transcript into the project language when the clip is in the other
- * language, and report what happened.
+ * Prepare a raw transcript for re-voicing: translate it into the project language when
+ * the clip is in the other one, polish the wording when asked, and report what happened.
+ *
+ * Both operations run in a single backend call. Translating and then polishing as two
+ * passes produces stilted output, because the polish inherits translation artefacts.
  *
  * @param {string} text Transcribed text in the spoken language.
- * @returns {Promise<string>} Text in the project language, or the original on failure.
+ * @returns {Promise<string>} Narration ready to synthesize, or the original on failure.
  */
-async function translateTranscript(text) {
+async function refineTranscript(text) {
   const source = videoWizardState.sourceLanguage;
   const target = state.language;
+  const polishEl = document.getElementById('vw-polish');
+  const polish = !!(polishEl && polishEl.checked);
   const row = document.getElementById('vw-translation-row');
   const statusEl = document.getElementById('vw-translation-status');
-  const retryBtn = document.getElementById('vw-retranslate-btn');
+  const retryBtn = document.getElementById('vw-refine-btn');
   const label = (lang) => (lang === 'fr' ? t('language.french') : t('language.english'));
 
   row.hidden = false;
   retryBtn.hidden = true;
 
-  if (source === target) {
+  const needsTranslation = source !== target;
+  if (!needsTranslation && !polish) {
     statusEl.className = 'text-dim';
-    statusEl.textContent = t('wizard.notTranslated', { source: label(source) });
+    statusEl.textContent = t('wizard.refinedNone', { source: label(source) });
+    retryBtn.hidden = false;
     return text;
   }
 
   statusEl.className = 'text-busy';
-  statusEl.textContent = `⏳ ${t('wizard.translating')}`;
+  statusEl.textContent = `⏳ ${polish ? t('wizard.refining') : t('wizard.translating')}`;
 
   try {
-    const res = await postJson('/translate-narration', {
+    const res = await postJson('/refine-narration', {
       text,
       source_language: source,
       target_language: target,
+      polish,
     });
     const data = await res.json();
-    if (!res.ok || !data.text) {
-      throw new Error(data.detail || t('status.failed'));
+    if (!res.ok || !data.text) throw new Error(data.detail || t('status.failed'));
+
+    const words = t('wizard.wordDelta', {
+      before: data.original_words,
+      after: data.refined_words,
+    });
+
+    // The backend rejects a rewrite that drifts too far from the original length and
+    // returns the transcript untouched. Say so rather than implying it was applied.
+    const rejected = !data.translated && !data.polished && data.detail;
+    if (rejected) {
+      statusEl.className = 'text-error';
+      statusEl.textContent = `⚠ ${t('wizard.lengthRejected')}`;
+    } else {
+      statusEl.className = 'text-done';
+      let key = 'wizard.refinedNone';
+      if (data.translated && data.polished) key = 'wizard.refinedTranslatedPolished';
+      else if (data.translated) key = 'wizard.refinedTranslated';
+      else if (data.polished) key = 'wizard.refinedPolished';
+      statusEl.textContent = `✓ ${t(key, {
+        source: label(source),
+        target: label(target),
+        words,
+      })}`;
     }
-    statusEl.className = 'text-done';
-    statusEl.textContent = `✓ ${t('wizard.translatedNotice', {
-      source: label(source),
-      target: label(target),
-    })}`;
     retryBtn.hidden = false;
     return data.text;
   } catch (err) {
-    // Keep the original text rather than losing the transcription; the user can edit
-    // or retry. Failing the whole flow here would waste the transcription job.
+    // Keep the transcript rather than losing it; the user can edit or retry. Failing
+    // the whole flow here would throw away a completed transcription job.
     statusEl.className = 'text-error';
-    statusEl.textContent = `✗ ${t('wizard.translationFailed', { error: err.message })}`;
+    statusEl.textContent = `✗ ${t('wizard.refineFailed', { error: err.message })}`;
     retryBtn.hidden = false;
     return text;
   }
 }
 
-document.getElementById('vw-retranslate-btn').addEventListener('click', async () => {
-  const source = videoWizardState.transcribedText;
-  if (!source) return;
-  const translated = await translateTranscript(source);
-  document.getElementById('vw-narration-text').value = translated;
+document.getElementById('vw-refine-btn').addEventListener('click', async () => {
+  // Always start from the raw transcript, so repeated refining does not compound
+  // rewrites of rewrites and drift away from the original meaning.
+  const original = videoWizardState.transcribedText;
+  if (!original) return;
+  const refined = await refineTranscript(original);
+  document.getElementById('vw-narration-text').value = refined;
+  invalidateWizardAudio();
+});
+
+// Changing the polish setting re-runs the refinement from the raw transcript.
+document.getElementById('vw-polish').addEventListener('change', async () => {
+  const original = videoWizardState.transcribedText;
+  if (!original) return;
+  const refined = await refineTranscript(original);
+  document.getElementById('vw-narration-text').value = refined;
   invalidateWizardAudio();
 });
 
@@ -3665,7 +3706,7 @@ async function transcribeVideo() {
 
         // Cross into the project language when the clip is in the other one, so the
         // synthesized voice-over matches the rest of the storyboard.
-        const forNarration = await translateTranscript(transcribed);
+        const forNarration = await refineTranscript(transcribed);
         document.getElementById('vw-narration-text').value = forNarration;
         invalidateWizardAudio();
         return;

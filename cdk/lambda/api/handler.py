@@ -45,6 +45,22 @@ DEFAULT_LANGUAGE = os.environ.get("DEFAULT_LANGUAGE", "en")
 # which keeps the caller inside API Gateway's 29-second response window.
 SELF_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", f"{SERVICE_NAME}-api")
 
+# ─── Nova Sonic capacity ───
+# Nova 2 Sonic's documented maximum output is 64K tokens. For a speech model the output
+# budget covers generated audio, so this bounds how much narration a single session can
+# speak.
+NOVA_SONIC_MAX_OUTPUT_TOKENS = 64000
+
+# Words per synthesis session. Narration longer than this is split across sessions and
+# the audio concatenated.
+#
+# Set conservatively rather than pushed to the limit. The previous value of 1100 words
+# meant a 3.5-minute video (roughly 500-600 words) was never split, and instead ran into
+# the per-session output cap and was silently truncated part-way through. Truncated
+# narration is a far worse outcome than an audible seam at a sentence boundary, and
+# _chunk_text_for_tts only splits between sentences.
+NOVA_SONIC_SESSION_WORD_LIMIT = 200
+
 # SSM SecureString holding the Gemini API key. Read lazily and cached for the life
 # of the execution environment, so the secret never sits in a Lambda environment
 # variable or in source control.
@@ -825,9 +841,13 @@ async def nova_sonic_synthesize(text, voice_id, region="us-east-1", language="en
 
     # Session start
     await send(bidi, {"event": {"sessionStart": {"inferenceConfiguration": {
-        # High token cap so long narration is never cut off mid-read. Nova Sonic's
-        # connection limit (~8 min of audio) is the real bound, not this.
-        "maxTokens": 32000, "topP": 0.9, "temperature": 0.7,
+        # 64K is Nova 2 Sonic's documented maximum output. For a speech model the
+        # output budget covers the generated audio, so this is a hard ceiling on how
+        # much narration one session can speak, and the previous 32000 truncated long
+        # reads around the 90-second mark with no error. Long narration is additionally
+        # split across sessions (see NOVA_SONIC_SESSION_WORD_LIMIT) so no single session
+        # ever approaches this bound.
+        "maxTokens": NOVA_SONIC_MAX_OUTPUT_TOKENS, "topP": 0.9, "temperature": 0.7,
     }}}})
 
     # Prompt start
@@ -1253,20 +1273,23 @@ async def nova_sonic_synthesize_long(text, voice_id, region="us-east-1", languag
         Concatenated PCM bytes, or None/empty when synthesis produced no audio.
     """
     word_count = len(text.split())
-    # ~150 wpm narration → ~1200 words ≈ 8 min. Stay safely under the limit.
-    SINGLE_SESSION_WORD_LIMIT = 1100
 
-    if word_count <= SINGLE_SESSION_WORD_LIMIT:
+    if word_count <= NOVA_SONIC_SESSION_WORD_LIMIT:
         return await nova_sonic_synthesize(text, voice_id, region, language)
 
-    chunks = _chunk_text_for_tts(text, max_words=900)
+    chunks = _chunk_text_for_tts(text, max_words=NOVA_SONIC_SESSION_WORD_LIMIT)
     if len(chunks) <= 1:
         return await nova_sonic_synthesize(text, voice_id, region, language)
 
-    logger.info(f"Nova Sonic: very long narration ({word_count} words) split into {len(chunks)} large parts")
+    logger.info(
+        f"Nova Sonic: narration is {word_count} words, splitting into {len(chunks)} "
+        f"sessions of up to {NOVA_SONIC_SESSION_WORD_LIMIT} words"
+    )
     SAMPLE_RATE = 24000
     pad = b"\x00\x00" * int(SAMPLE_RATE * 0.2)  # ~200ms gap between parts
     all_pcm = []
+    failed_parts = []
+
     for i, chunk in enumerate(chunks):
         pcm = None
         for attempt in range(2):
@@ -1280,9 +1303,32 @@ async def nova_sonic_synthesize_long(text, voice_id, region="us-east-1", languag
             if all_pcm:
                 all_pcm.append(pad)
             all_pcm.append(pcm)
-            logger.info(f"Nova Sonic part {i+1}/{len(chunks)} ok ({len(pcm)} bytes)")
+            # Flag a part whose audio is far shorter than its word count implies. This is
+            # the signal that a session hit an output cap, which previously happened
+            # silently and left narration ending mid-sentence.
+            spoken_seconds = len(pcm) / (SAMPLE_RATE * 2)
+            chunk_words = len(chunk.split())
+            if spoken_seconds > 0 and chunk_words / spoken_seconds > 6.0:
+                logger.error(
+                    f"Nova Sonic part {i+1}/{len(chunks)} looks truncated: {chunk_words} words "
+                    f"in only {spoken_seconds:.1f}s of audio. The session likely hit its output cap."
+                )
+            else:
+                logger.info(
+                    f"Nova Sonic part {i+1}/{len(chunks)} ok ({chunk_words} words, {spoken_seconds:.1f}s)"
+                )
         else:
-            logger.warning(f"Nova Sonic part {i+1}/{len(chunks)} produced no audio after retry")
+            failed_parts.append(i + 1)
+            logger.error(f"Nova Sonic part {i+1}/{len(chunks)} produced no audio after retry")
+
+    if failed_parts:
+        # Returning partial audio silently is what made the original truncation hard to
+        # spot. The caller still gets what succeeded, but the gap is recorded loudly.
+        logger.error(
+            f"Nova Sonic: {len(failed_parts)} of {len(chunks)} parts produced no audio "
+            f"(parts {failed_parts}); the narration is incomplete"
+        )
+
     return b"".join(all_pcm)
 
 
@@ -2173,15 +2219,28 @@ Available character names: {char_names_json}
                 s["image_prompt"] = f"{prefix}{chars_txt} in a scene depicting: {scene_hint}, cinematic framing, warm natural lighting"
                 logger.warning(f"Shot '{title_txt}' had an empty image_prompt — generated a fallback prompt")
 
-            # For SD3.5: enforce consistent style prefix at the start of every prompt
-            if image_model == "sd35" and style_keywords and s["image_prompt"]:
+            # Enforce the chosen style prefix on EVERY prompt, for every image model.
+            #
+            # The system prompt asks for it, but that is an instruction, not a
+            # guarantee: Claude drops or invents a style prefix often enough to matter
+            # (observed prompts beginning "Realistic!" on a pastel-cartoon project).
+            # This used to run only for sd35, which left Gemini — the default model —
+            # with no style signal in the text whenever Claude omitted the tag. The
+            # output then fell back to whatever the reference images implied, so the
+            # picked style appeared to have no effect and every shot converged on a
+            # flat cartoon look.
+            if style_keywords and s["image_prompt"]:
                 prompt = s["image_prompt"]
-                # If the prompt doesn't start with the style prefix, prepend it
                 if not prompt.lower().startswith(style_keywords[:20].lower()):
-                    # Strip any style-like prefix Claude may have invented
-                    # Common patterns: "Semi-realistic...,", "3D-render-lite,", "Digital illustration,"
+                    # Strip any style-like prefix Claude invented, so the real prefix is
+                    # not left competing with a contradictory one. Only a short leading
+                    # clause is removed, to avoid eating actual scene content.
                     prompt = re.sub(r'^[^,]{0,60},\s*', '', prompt, count=1)
                     s["image_prompt"] = f"{style_keywords}, {prompt}"
+                    logger.info(
+                        f"Shot '{s.get('title', '?')}': prepended the style prefix that "
+                        f"was missing from the generated prompt"
+                    )
 
             # For SD3.5: ensure characters_in_shot is not empty (IP-Adapter needs references)
             if image_model == "sd35" and not s.get("characters_in_shot") and char_names_list:
@@ -2225,6 +2284,8 @@ Available character names: {char_names_json}
             "art_direction": art_direction,
             "image_model": image_model,
             "language": language,
+            "style_key": payload.get("style_key", ""),
+            "style_prefix": style_keywords,
         }).encode(), "application/json")
 
         # Also create a manifest so this run appears in Previous Runs immediately
@@ -2241,6 +2302,12 @@ Available character names: {char_names_json}
             # The project language is persisted so reopening a run later restores
             # the right voices, prompt handling, and console language.
             "language": language,
+            # Which preset the user picked, and the condensed tag actually applied to
+            # every prompt. Without these there is no way to tell afterwards whether a
+            # style selection took effect, which is exactly what made the missing
+            # prefix enforcement hard to diagnose.
+            "style_key": payload.get("style_key", ""),
+            "style_prefix": style_keywords,
             "characters": characters,
             "characters_en": characters_en,
             "art_direction": art_direction,
@@ -3675,7 +3742,8 @@ def handle_sync_storyboard(event):
     manifest["updated_at"] = now_iso()
     for fld in ("project_name", "project_description", "image_model", "characters",
                 "characters_en", "art_direction", "music_file", "wallpaper_file",
-                "music_volume", "settings", "selected_voice", "language"):
+                "music_volume", "settings", "selected_voice", "language",
+                "style_key", "style_prefix"):
         if fld in body and body[fld] not in (None, ""):
             manifest[fld] = body[fld]
 
@@ -4099,82 +4167,159 @@ def handle_transcribe_status(event):
         return respond(500, {"detail": f"Status check failed: {str(e)}"})
 
 
-# ── Translate Narration (cross-language re-voicing of uploaded video) ──
-def handle_translate_narration(event):
-    """Translate narration text between the supported languages.
+# ── Refine Narration (translate and/or polish for re-voicing uploaded video) ──
 
-    Used when an uploaded video is voiced in one language and the project needs it in
-    the other: transcribe in the spoken language, translate here, then synthesize with
-    a voice for the target language.
+# The polished text is dubbed over footage of fixed duration, so length is a hard
+# constraint, not a preference. The model is asked to stay within ±10%; anything beyond
+# the outer bound is rejected in favour of the original, because narration that no longer
+# fits the picture is worse than narration that reads a little roughly.
+REFINE_TARGET_TOLERANCE = 0.10
+REFINE_REJECT_TOLERANCE = 0.25
 
-    Unlike translate_prompt_to_english this produces text meant to be *spoken*, so it
-    optimizes for natural delivery and preserved timing rather than for literal
-    structure. It keeps roughly the same length, because the result is dubbed over
-    footage of a fixed duration.
+
+def handle_refine_narration(event):
+    """Translate and/or polish voice-over narration, preserving spoken length.
+
+    Serves two needs for uploaded video, in a single model call so the two never fight
+    each other:
+
+      Translation — the clip is voiced in one language and the project needs the other.
+      Polish      — raw transcripts of spontaneous speech carry filler, false starts and
+                    repetition. Cleaning them up makes the re-voiced narration sound
+                    professional.
+
+    Doing both at once matters: translating first and polishing after tends to produce
+    stilted output, because the polish pass inherits translation artefacts.
+
+    Length is guarded rather than merely requested. The result is dubbed over footage of
+    a fixed duration, so a refinement that runs materially longer or shorter is rejected
+    and the original returned.
     """
     body = parse_json_body(event)
     text = (body.get("text") or "").strip()
     source_language = normalize_language(body.get("source_language"))
     target_language = normalize_language(body.get("target_language"))
+    # Default on: a raw transcript almost always reads better for a small cost.
+    polish = body.get("polish", True) is not False
 
     if not text:
         return respond(400, {"detail": "text is required"})
 
-    if source_language == target_language:
-        # Nothing to do. Answering successfully keeps the caller simple.
+    needs_translation = source_language != target_language
+    if not needs_translation and not polish:
+        # Nothing asked for. Answering successfully keeps the caller simple.
         return respond(200, {
             "text": text,
             "translated": False,
+            "polished": False,
             "source_language": source_language,
             "target_language": target_language,
+            "original_words": len(text.split()),
+            "refined_words": len(text.split()),
         })
 
     source_name = LANGUAGE_NAMES[source_language]
     target_name = LANGUAGE_NAMES[target_language]
+    original_words = len(text.split())
+    lower_words = int(original_words * (1 - REFINE_TARGET_TOLERANCE))
+    upper_words = int(original_words * (1 + REFINE_TARGET_TOLERANCE))
+
+    tasks = []
+    if needs_translation:
+        tasks.append(f"translate it from {source_name} to {target_name}")
+    if polish:
+        tasks.append("polish it so it reads as fluent, professional voice-over")
 
     system = (
-        f"You translate voice-over narration from {source_name} to {target_name}.\n"
-        "RULES:\n"
-        "- Return ONLY the translated narration. No preamble, no quotes, no notes.\n"
-        "- This will be read aloud over existing video, so keep the spoken length as "
-        "close to the original as you can. Prefer natural phrasing over literal wording.\n"
-        "- Preserve the tone and register of the original.\n"
-        "- Keep proper nouns, brand names, and place names unchanged.\n"
-        "- Expand nothing and add nothing that is not in the source.\n"
-        "- Write out numbers and abbreviations the way they should be spoken."
+        f"You prepare voice-over narration for video. Your job is to {' and '.join(tasks)}.\n\n"
+        "LENGTH IS A HARD CONSTRAINT:\n"
+        f"- The source is {original_words} words. Your output MUST be between "
+        f"{lower_words} and {upper_words} words.\n"
+        "- This narration is spoken over existing footage of fixed length. Running long "
+        "or short breaks synchronisation with the picture.\n"
+        "- Do not summarise, and do not pad. Rephrase at the same length.\n\n"
+        "WHAT TO IMPROVE:\n"
+        "- Remove filler and hesitation: um, uh, you know, like, I mean, sort of.\n"
+        "- Remove false starts, self-corrections, and accidental repetition.\n"
+        "- Join fragments into complete, well-formed sentences.\n"
+        "- Fix grammar and word order from transcription of spontaneous speech.\n"
+        "- Smooth transitions between sentences so it flows when read aloud.\n"
+        "- Use a confident, professional register suited to a marketing voice-over.\n\n"
+        "WHAT TO PRESERVE:\n"
+        "- Every fact, figure, name, and claim. Add nothing that is not in the source.\n"
+        "- The order in which points are made, so the narration still matches the visuals.\n"
+        "- Proper nouns, brand names, and place names, exactly as given.\n"
+        "- The speaker's intent and emphasis.\n\n"
+        "OUTPUT:\n"
+        "- Return ONLY the finished narration. No preamble, no quotes, no notes, no "
+        "explanation of what you changed.\n"
+        "- Write numbers and abbreviations the way they should be spoken aloud."
     )
     if target_language == "fr":
         system += (
-            "\n- Use natural, idiomatic French with French typographic convention: a "
+            "\n- Write natural, idiomatic French using French typographic convention: a "
             "space before : ; ! and ?, and guillemets for quotations."
         )
 
     try:
-        translated = call_claude(system, text, max_tokens=4000).strip().strip('"').strip("'")
-        if not translated:
-            logger.warning("Narration translation returned empty text; keeping the original")
-            return respond(200, {
-                "text": text,
-                "translated": False,
-                "source_language": source_language,
-                "target_language": target_language,
-                "detail": "Translation returned no text",
-            })
+        refined = call_claude(system, text, max_tokens=6000).strip().strip('"').strip("'")
+    except ClientError as e:
+        logger.exception(f"Narration refinement failed {source_language} -> {target_language}")
+        return respond(500, {"detail": str(e)})
 
-        logger.info(
-            f"Translated narration {source_language} -> {target_language} "
-            f"({len(text)} chars -> {len(translated)} chars)"
-        )
+    if not refined:
+        logger.warning("Narration refinement returned empty text; keeping the original")
         return respond(200, {
-            "text": translated,
-            "original_text": text,
-            "translated": True,
+            "text": text,
+            "translated": False,
+            "polished": False,
             "source_language": source_language,
             "target_language": target_language,
+            "original_words": original_words,
+            "refined_words": original_words,
+            "detail": "Refinement returned no text",
         })
-    except ClientError as e:
-        logger.exception(f"Narration translation failed {source_language} -> {target_language}")
-        return respond(500, {"detail": str(e)})
+
+    refined_words = len(refined.split())
+    drift = abs(refined_words - original_words) / max(1, original_words)
+
+    if drift > REFINE_REJECT_TOLERANCE:
+        # Reject rather than hand back narration that will not fit the footage. The
+        # transcript is still usable as-is, so nothing is lost.
+        logger.warning(
+            f"Narration refinement changed length by {drift*100:.0f}% "
+            f"({original_words} -> {refined_words} words), beyond the "
+            f"{REFINE_REJECT_TOLERANCE*100:.0f}% limit; keeping the original"
+        )
+        return respond(200, {
+            "text": text,
+            "translated": False,
+            "polished": False,
+            "source_language": source_language,
+            "target_language": target_language,
+            "original_words": original_words,
+            "refined_words": refined_words,
+            "detail": (
+                f"The refined narration was {refined_words} words against {original_words} "
+                "in the original, which would not fit the video. The original was kept."
+            ),
+        })
+
+    logger.info(
+        f"Refined narration {source_language} -> {target_language} "
+        f"(translate={needs_translation} polish={polish}): "
+        f"{original_words} -> {refined_words} words ({drift*100:.0f}% drift)"
+    )
+    return respond(200, {
+        "text": refined,
+        "original_text": text,
+        "translated": needs_translation,
+        "polished": polish,
+        "source_language": source_language,
+        "target_language": target_language,
+        "original_words": original_words,
+        "refined_words": refined_words,
+    })
 
 
 # ── Preview Merge (merge video + audio into a preview clip) ──
@@ -4307,7 +4452,11 @@ ROUTES = {
     ("POST", "/api/runs/{run_id}/save-as"):                  handle_save_as_project,
     ("POST", "/api/transcribe-video"):                       handle_transcribe_video,
     ("POST", "/api/transcribe-status"):                      handle_transcribe_status,
-    ("POST", "/api/translate-narration"):                    handle_translate_narration,
+    # Both names route to the same handler. /api/refine-narration is the current name;
+    # /api/translate-narration is kept so a browser holding a cached app.js from the
+    # previous deploy keeps working rather than failing mid-session.
+    ("POST", "/api/refine-narration"):                       handle_refine_narration,
+    ("POST", "/api/translate-narration"):                    handle_refine_narration,
     ("POST", "/api/preview-merge"):                          handle_preview_merge,
     ("POST", "/api/preview-merge-status"):                   handle_preview_merge_status,
     ("POST", "/api/presign-key"):                            handle_presign_key,

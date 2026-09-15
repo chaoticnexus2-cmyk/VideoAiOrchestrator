@@ -641,6 +641,21 @@
             <p class="panel-note" data-i18n="wizard.spokenLanguageHelp"></p>
           </div>
 
+          <!--
+            Cleans up transcribed spontaneous speech. On by default: a raw transcript
+            almost always reads better once filler and false starts are removed, and the
+            backend rejects any rewrite that drifts too far from the original length.
+          -->
+          <div id="vw-polish-row" hidden style="margin-bottom:1rem;">
+            <label class="vw-radio-option" style="align-items:center;">
+              <input type="checkbox" id="vw-polish" checked>
+              <span>
+                <span class="vw-radio-title" data-i18n="wizard.polish">Polish the wording</span><br>
+                <span class="vw-radio-desc" data-i18n="wizard.polishHelp"></span>
+              </span>
+            </label>
+          </div>
+
           <div style="margin-bottom:1rem;">
             <label><span aria-hidden="true">🎙️</span> <span data-i18n="wizard.voice">Voice</span></label>
             <div id="vw-voice-picker" style="display:flex;flex-wrap:wrap;gap:.4rem;"></div>
@@ -660,8 +675,8 @@
             <!-- Reports whether the transcript was translated, and offers a retry. -->
             <div id="vw-translation-row" hidden style="display:flex;align-items:center;gap:.6rem;margin-top:.4rem;flex-wrap:wrap;">
               <span id="vw-translation-status" style="font-size:.75rem;"></span>
-              <button class="btn btn-ghost btn-sm" id="vw-retranslate-btn" hidden
-                      data-i18n="wizard.retranslate">Translate again</button>
+              <button class="btn btn-ghost btn-sm" id="vw-refine-btn" hidden
+                      data-i18n="wizard.refineAgain">Refine again</button>
             </div>
           </div>
 

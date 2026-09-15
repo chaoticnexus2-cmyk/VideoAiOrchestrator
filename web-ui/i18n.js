@@ -422,13 +422,24 @@ const I18N_STRINGS = {
     'wizard.formats': 'MP4, MOV, and WebM supported · up to about 10 minutes for transcription',
     'wizard.audioTrack': 'Audio Track',
     'wizard.spokenLanguage': 'Language spoken in the video',
+    'wizard.polish': 'Polish the wording',
+    'wizard.polishHelp':
+      'Removes filler and false starts from the transcript and smooths the phrasing so it reads as professional voice-over. Kept to the same length so it still matches the footage.',
+    'wizard.refining': 'Refining…',
+    'wizard.refinedTranslatedPolished':
+      'Transcribed in {source}, translated to {target}, and polished. {words}',
+    'wizard.refinedTranslated': 'Transcribed in {source} and translated to {target}. {words}',
+    'wizard.refinedPolished': 'Transcribed in {source} and polished. {words}',
+    'wizard.refinedNone': 'Transcribed in {source}. No changes applied.',
+    'wizard.wordDelta': '{before} words to {after}.',
+    'wizard.lengthRejected':
+      'The rewrite came out too far from the original length, so the transcript was kept unchanged.',
+    'wizard.refineFailed':
+      'Could not refine the transcript: {error}. The original text is shown; edit it before synthesizing.',
+    'wizard.refineAgain': 'Refine again',
     'wizard.spokenLanguageHelp':
       'What is spoken in the clip, which can differ from the project language. When they differ, the transcript is translated so the new voice-over matches your project.',
     'wizard.translating': 'Translating…',
-    'wizard.translatedNotice': 'Transcribed in {source} and translated to {target}. Review before synthesizing.',
-    'wizard.notTranslated': 'Transcribed in {source}, the same as the project language.',
-    'wizard.translationFailed': 'Could not translate the transcript: {error}. The original text is shown; edit it before synthesizing.',
-    'wizard.retranslate': 'Translate again',
     'wizard.voiceTargetNote': 'The voice-over is generated in {target}, the project language.',
     'wizard.useNative': 'Use Native Audio',
     'wizard.useNativeDesc': 'Keep the original audio track from the video',
@@ -885,13 +896,24 @@ const I18N_STRINGS = {
       'MP4, MOV et WebM pris en charge · jusqu\u2019à environ 10 minutes pour la transcription',
     'wizard.audioTrack': 'Piste audio',
     'wizard.spokenLanguage': 'Langue parlée dans la vidéo',
+    'wizard.polish': 'Améliorer la formulation',
+    'wizard.polishHelp':
+      'Supprime les hésitations et les faux départs de la transcription et fluidifie la formulation pour obtenir une voix hors champ professionnelle. La longueur est conservée afin de rester synchronisée avec les images.',
+    'wizard.refining': 'Amélioration…',
+    'wizard.refinedTranslatedPolished':
+      'Transcrit en {source}, traduit en {target} et amélioré. {words}',
+    'wizard.refinedTranslated': 'Transcrit en {source} et traduit en {target}. {words}',
+    'wizard.refinedPolished': 'Transcrit en {source} et amélioré. {words}',
+    'wizard.refinedNone': 'Transcrit en {source}. Aucune modification appliquée.',
+    'wizard.wordDelta': '{before} mots à {after}.',
+    'wizard.lengthRejected':
+      'La reformulation s\u2019écartait trop de la longueur d\u2019origine ; la transcription a été conservée telle quelle.',
+    'wizard.refineFailed':
+      'Impossible d\u2019améliorer la transcription : {error}. Le texte original est affiché ; modifiez-le avant de générer la voix.',
+    'wizard.refineAgain': 'Améliorer à nouveau',
     'wizard.spokenLanguageHelp':
       'La langue parlée dans le clip, qui peut différer de celle du projet. Lorsqu\u2019elles diffèrent, la transcription est traduite afin que la nouvelle voix hors champ corresponde à votre projet.',
     'wizard.translating': 'Traduction…',
-    'wizard.translatedNotice': 'Transcrit en {source} puis traduit en {target}. Vérifiez avant de générer la voix.',
-    'wizard.notTranslated': 'Transcrit en {source}, la même langue que le projet.',
-    'wizard.translationFailed': 'Impossible de traduire la transcription : {error}. Le texte original est affiché ; modifiez-le avant de générer la voix.',
-    'wizard.retranslate': 'Traduire à nouveau',
     'wizard.voiceTargetNote': 'La voix hors champ est générée en {target}, la langue du projet.',
     'wizard.useNative': 'Utiliser l\u2019audio natif',
     'wizard.useNativeDesc': 'Conserver la piste audio d\u2019origine de la vidéo',
