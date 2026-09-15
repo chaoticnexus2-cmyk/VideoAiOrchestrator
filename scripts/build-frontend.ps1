@@ -7,7 +7,7 @@
   outputs, so the API URL and Cognito IDs are never hardcoded in source.
 
   web-ui/ is the single source of truth. web-ui-dist/ is generated and
-  gitignored — never edit it directly.
+  gitignored - never edit it directly.
 
 .PARAMETER StackName
   CloudFormation stack to read outputs from. Defaults to VaioStack.

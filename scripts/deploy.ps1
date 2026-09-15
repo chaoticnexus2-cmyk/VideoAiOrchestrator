@@ -63,7 +63,7 @@ Invoke-Step "3/5 Stage frontend" {
         & (Join-Path $PSScriptRoot "build-frontend.ps1") -StackName $stackName -Region $Region
     }
     else {
-        Write-Host "Stack not deployed yet — staging with a placeholder config." -ForegroundColor Yellow
+        Write-Host "Stack not deployed yet - staging with a placeholder config." -ForegroundColor Yellow
         & (Join-Path $PSScriptRoot "build-frontend.ps1") -SkipConfig
     }
     $global:LASTEXITCODE = 0

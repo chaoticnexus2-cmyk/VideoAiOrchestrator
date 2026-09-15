@@ -56,7 +56,7 @@ if ($Email -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
     throw "'$Email' does not look like an email address."
 }
 
-# ── Resolve the user pool from the stack ─────────────────────────────────
+# -- Resolve the user pool from the stack ---------------------------------
 $poolId = (aws cloudformation describe-stacks `
         --stack-name $StackName `
         --region $Region `
@@ -67,7 +67,7 @@ if ($LASTEXITCODE -ne 0 -or -not $poolId -or $poolId -eq "None") {
 }
 $poolId = $poolId.Trim()
 
-# ── Temporary password ───────────────────────────────────────────────────
+# -- Temporary password ---------------------------------------------------
 if (-not $TemporaryPassword) {
     # Assemble from explicit character classes rather than a random slice, so the
     # result always satisfies the pool policy instead of usually satisfying it.

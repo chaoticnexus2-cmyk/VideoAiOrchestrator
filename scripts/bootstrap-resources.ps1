@@ -46,7 +46,7 @@ $accountId = $accountId.Trim()
 $codeBucket = "vaio-lambda-code-$accountId"
 $geminiParam = "/vaio/gemini-api-key"
 
-# ── 1. Lambda code bucket ────────────────────────────────────────────────
+# -- 1. Lambda code bucket ------------------------------------------------
 aws s3api head-bucket --bucket $codeBucket --region $Region 2>$null
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Code bucket already exists: $codeBucket" -ForegroundColor DarkGray
@@ -69,7 +69,7 @@ else {
     Write-Host "  Public access blocked, SSE-S3 enabled" -ForegroundColor DarkGray
 }
 
-# ── 2. Merge Lambda bundle ───────────────────────────────────────────────
+# -- 2. Merge Lambda bundle -----------------------------------------------
 # The bundle carries a static ffmpeg binary plus moviepy (~52 MB zipped), which is
 # past Lambda's direct-upload limit, so it has to be staged in S3 before the function
 # that references it can be created.
@@ -112,7 +112,7 @@ Or point at an existing bundle:
     }
 }
 
-# ── 3. Gemini API key ────────────────────────────────────────────────────
+# -- 3. Gemini API key ----------------------------------------------------
 if ($GeminiApiKey) {
     Write-Host "Writing SecureString $geminiParam" -ForegroundColor Cyan
     aws ssm put-parameter `
